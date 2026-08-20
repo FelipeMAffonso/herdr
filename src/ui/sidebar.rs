@@ -314,10 +314,16 @@ pub(crate) enum WorkspaceListEntry {
     Workspace { ws_idx: usize, indented: bool },
 }
 
-/// Collapse key for a tag group. Kept distinct from worktree-space keys, which
-/// use their raw repo key, so the two grouping mechanisms never collide.
+/// Collapse key for a spaces tag group. Kept distinct from worktree-space keys,
+/// which use their raw repo key, so the two grouping mechanisms never collide.
 pub(crate) fn tag_collapse_key(tag: &str) -> String {
     format!("tag:{tag}")
+}
+
+/// Collapse key for an agents-panel tag group. Kept distinct from the spaces
+/// `tag:<name>` key so a tag can be collapsed in one panel and open in the other.
+pub(crate) fn agent_tag_collapse_key(tag: &str) -> String {
+    format!("agent-tag:{tag}")
 }
 
 /// Rolled-up attention level for a group of workspaces, most-urgent first. Used
@@ -855,6 +861,137 @@ pub(crate) fn agent_entry_gap(app: &AppState, entry_idx: usize, entry_count: usi
     }
 }
 
+/// A display row in the agents panel: either a tag group header or an agent
+/// entry. Entries carry the index into [`agent_panel_entries`] so hit-testing
+/// resolves back to the same `AgentPanelEntry` the panel drew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentPanelRow {
+    Header {
+        tag: String,
+        count: usize,
+        collapsed: bool,
+        /// Rolled-up attention across the group's member agents, most-urgent
+        /// first, driving the header's leading edge exactly as the spaces
+        /// headers color theirs.
+        need: Option<NeedLevel>,
+    },
+    Entry {
+        /// Index into [`agent_panel_entries`].
+        entry_idx: usize,
+    },
+}
+
+/// True when any agent-panel entry inherits a tag from its workspace, so the
+/// panel should group its rows under tag headers.
+pub(crate) fn has_agent_tag_groups(app: &AppState, entries: &[AgentPanelEntry]) -> bool {
+    entries.iter().any(|entry| {
+        app.workspaces
+            .get(entry.ws_idx)
+            .and_then(|ws| ws.tag())
+            .is_some()
+    })
+}
+
+/// Group the agent-panel entries by their inherited workspace tag, interleaving
+/// a one-row header before each group (first-appearance tag order) with the
+/// untagged entries listed after, mirroring the spaces list. An agent is never
+/// tagged directly: it inherits its workspace's tag. When no entry carries a
+/// tag, this is the plain entry list with no headers.
+pub(crate) fn agent_panel_display_rows(
+    app: &AppState,
+    entries: &[AgentPanelEntry],
+) -> Vec<AgentPanelRow> {
+    if !has_agent_tag_groups(app, entries) {
+        return (0..entries.len())
+            .map(|entry_idx| AgentPanelRow::Entry { entry_idx })
+            .collect();
+    }
+
+    let entry_tags: Vec<Option<String>> = entries
+        .iter()
+        .map(|entry| {
+            app.workspaces
+                .get(entry.ws_idx)
+                .and_then(|ws| ws.tag().map(str::to_string))
+        })
+        .collect();
+    let grouping = group_entries_by_tag(&entry_tags);
+
+    let mut rows = Vec::new();
+    for group in &grouping.groups {
+        let collapsed = app
+            .collapsed_space_keys
+            .contains(&agent_tag_collapse_key(&group.tag));
+        let member_states: Vec<(AgentState, bool)> = group
+            .member_entry_indices
+            .iter()
+            .filter_map(|entry_idx| entries.get(*entry_idx))
+            .map(|entry| (entry.state, entry.seen))
+            .collect();
+        rows.push(AgentPanelRow::Header {
+            tag: group.tag.clone(),
+            count: group.member_entry_indices.len(),
+            collapsed,
+            need: need_rollup(&member_states),
+        });
+        if collapsed {
+            continue;
+        }
+        for entry_idx in &group.member_entry_indices {
+            rows.push(AgentPanelRow::Entry {
+                entry_idx: *entry_idx,
+            });
+        }
+    }
+    for entry_idx in &grouping.ungrouped {
+        rows.push(AgentPanelRow::Entry {
+            entry_idx: *entry_idx,
+        });
+    }
+
+    rows
+}
+
+/// Display-row index of the entry at `entry_idx`, mapping an `agent_panel_entries`
+/// index through the interleaved header rows so scroll math (which indexes the
+/// display list) can target the right visible row. `None` when the entry is
+/// hidden inside a collapsed group or out of range.
+pub(crate) fn agent_panel_display_row_for_entry(
+    rows: &[AgentPanelRow],
+    entry_idx: usize,
+) -> Option<usize> {
+    rows.iter()
+        .position(|row| matches!(row, AgentPanelRow::Entry { entry_idx: e } if *e == entry_idx))
+}
+
+/// Height of one agent-panel display row within the body: a header is one row
+/// tall, an entry is its rendered agent-rows height.
+pub(crate) fn agent_display_row_height(
+    app: &AppState,
+    entries: &[AgentPanelEntry],
+    row: &AgentPanelRow,
+    body_height: u16,
+) -> u16 {
+    match row {
+        AgentPanelRow::Header { .. } => 1u16.min(body_height),
+        AgentPanelRow::Entry { entry_idx } => entries
+            .get(*entry_idx)
+            .map(|entry| agent_entry_height_in_body(app, entry, body_height))
+            .unwrap_or(0),
+    }
+}
+
+/// Row gap after an agent-panel display row. Headers sit flush against the row
+/// below them; every other row but the last carries the configured agents gap.
+pub(crate) fn agent_display_row_gap(app: &AppState, rows: &[AgentPanelRow], idx: usize) -> u16 {
+    let is_header = matches!(rows.get(idx), Some(AgentPanelRow::Header { .. }));
+    if idx + 1 < rows.len() && !is_header {
+        app.sidebar_agents.row_gap
+    } else {
+        0
+    }
+}
+
 fn agent_panel_visible_count_from(app: &AppState, area: Rect, scroll: usize) -> usize {
     let body = agent_panel_body_rect(area, false);
     if body.width == 0 || body.height == 0 {
@@ -864,15 +1001,16 @@ fn agent_panel_visible_count_from(app: &AppState, area: Rect, scroll: usize) -> 
     let mut used_rows = 0u16;
     let mut visible = 0usize;
     let entries = agent_panel_entries(app);
-    for (index, entry) in entries.iter().enumerate().skip(scroll) {
-        let height = agent_entry_height_in_body(app, entry, body.height);
+    let rows = agent_panel_display_rows(app, &entries);
+    for (index, row) in rows.iter().enumerate().skip(scroll) {
+        let height = agent_display_row_height(app, &entries, row, body.height);
         if used_rows.saturating_add(height) > body.height {
             break;
         }
         used_rows = used_rows.saturating_add(height);
         visible += 1;
         used_rows = used_rows
-            .saturating_add(agent_entry_gap(app, index, entries.len()))
+            .saturating_add(agent_display_row_gap(app, &rows, index))
             .min(body.height);
     }
     visible
@@ -881,18 +1019,19 @@ fn agent_panel_visible_count_from(app: &AppState, area: Rect, scroll: usize) -> 
 fn agent_panel_bottom_start(app: &AppState, area: Rect) -> usize {
     let body = agent_panel_body_rect(area, false);
     let entries = agent_panel_entries(app);
+    let rows = agent_panel_display_rows(app, &entries);
     let mut used_rows = 0u16;
-    let mut start = entries.len();
-    for (index, entry) in entries.iter().enumerate().rev() {
-        let gap = agent_entry_gap(app, index, entries.len());
-        let needed = agent_entry_height_in_body(app, entry, body.height).saturating_add(gap);
+    let mut start = rows.len();
+    for (index, row) in rows.iter().enumerate().rev() {
+        let gap = agent_display_row_gap(app, &rows, index);
+        let needed = agent_display_row_height(app, &entries, row, body.height).saturating_add(gap);
         if used_rows.saturating_add(needed) > body.height {
             break;
         }
         used_rows = used_rows.saturating_add(needed);
         start = index;
     }
-    start.min(entries.len().saturating_sub(1))
+    start.min(rows.len().saturating_sub(1))
 }
 
 pub(crate) fn agent_panel_scroll_for_target(
@@ -1846,6 +1985,38 @@ fn render_workspace_list(
     }
 }
 
+/// Render one agents-panel tag group header at `row_y`: leading attention edge,
+/// colored chevron, bold tag name in its stable color, dim count. Mirrors the
+/// spaces list's `render_tag_group_header`; the agents panel does not indent
+/// member rows, so the header carries no indent either.
+fn render_agent_tag_group_header(
+    app: &AppState,
+    frame: &mut Frame,
+    body: Rect,
+    row_y: u16,
+    tag: &str,
+    count: usize,
+    collapsed: bool,
+    need: Option<NeedLevel>,
+) {
+    let p = &app.palette;
+    let color = tag_color(tag, p);
+    let chevron = if collapsed { "▸" } else { "▾" };
+    let spans = vec![
+        tag_group_edge(need, p),
+        Span::styled(format!("{chevron} "), Style::default().fg(color)),
+        Span::styled(
+            tag.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {count}"), Style::default().fg(p.overlay0)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(body.x, row_y, body.width, 1),
+    );
+}
+
 fn render_agent_detail(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1909,7 +2080,30 @@ fn render_agent_detail(
     let scroll = app.agent_panel_scroll.min(metrics.max_offset_from_bottom);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
-    for (index, detail) in details.iter().enumerate().skip(scroll) {
+    let display_rows = agent_panel_display_rows(app, &details);
+    for (index, row) in display_rows.iter().enumerate().skip(scroll) {
+        let gap = agent_display_row_gap(app, &display_rows, index);
+        let entry_idx = match row {
+            AgentPanelRow::Header {
+                tag,
+                count,
+                collapsed,
+                need,
+            } => {
+                if row_y >= body_bottom {
+                    break;
+                }
+                render_agent_tag_group_header(
+                    app, frame, body, row_y, tag, *count, *collapsed, *need,
+                );
+                row_y = row_y.saturating_add(1).saturating_add(gap).min(body_bottom);
+                continue;
+            }
+            AgentPanelRow::Entry { entry_idx } => *entry_idx,
+        };
+        let Some(detail) = details.get(entry_idx) else {
+            continue;
+        };
         let label_color = state_label_color(detail.state, detail.seen, p);
         let rows = resolved_agent_rows(app, detail);
         let height = (rows.len().max(1) as u16).min(body.height);
@@ -1956,7 +2150,7 @@ fn render_agent_detail(
         }
         row_y = row_y
             .saturating_add(height)
-            .saturating_add(agent_entry_gap(app, index, details.len()))
+            .saturating_add(gap)
             .min(body_bottom);
     }
 
@@ -3832,6 +4026,186 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         );
         // Unknown-only rolls up to nothing.
         assert_eq!(need_rollup(&[(AgentState::Unknown, true)]), None);
+    }
+
+    /// Build an app whose workspaces each own one detected agent, tagged as
+    /// given, with a state/seen pair, so the agents panel produces one entry per
+    /// workspace. Returns the app ready for `agent_panel_entries`.
+    fn tagged_agent_app(specs: &[(&str, Option<&str>, AgentState, bool)]) -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces = specs
+            .iter()
+            .map(|(name, tag, _, _)| tagged_workspace(name, *tag))
+            .collect();
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+        for (ws_idx, (_, _, state, seen)) in specs.iter().enumerate() {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = *state;
+            app.workspaces[ws_idx].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = *seen;
+        }
+        app
+    }
+
+    #[test]
+    fn agent_panel_display_rows_group_by_inherited_tag_first_appearance_untagged_last() {
+        let app = tagged_agent_app(&[
+            ("a", Some("research"), AgentState::Idle, true),
+            ("b", None, AgentState::Idle, true),
+            ("c", Some("research"), AgentState::Idle, true),
+            ("d", Some("teaching"), AgentState::Idle, true),
+        ]);
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        // research header, its two members (entry idx 0 and 2), teaching header,
+        // its member (entry idx 3), then the untagged remainder (entry idx 1).
+        let header_tags: Vec<(&str, usize)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                AgentPanelRow::Header { tag, count, .. } => Some((tag.as_str(), *count)),
+                AgentPanelRow::Entry { .. } => None,
+            })
+            .collect();
+        assert_eq!(header_tags, vec![("research", 2), ("teaching", 1)]);
+
+        let entry_order: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| match row {
+                AgentPanelRow::Entry { entry_idx } => Some(*entry_idx),
+                AgentPanelRow::Header { .. } => None,
+            })
+            .collect();
+        // Members are pulled under their header in original order; untagged last.
+        assert_eq!(entry_order, vec![0, 2, 3, 1]);
+    }
+
+    #[test]
+    fn agent_panel_no_tags_yields_plain_entry_rows_without_headers() {
+        let app = tagged_agent_app(&[
+            ("a", None, AgentState::Idle, true),
+            ("b", None, AgentState::Working, true),
+        ]);
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        assert_eq!(
+            rows,
+            vec![
+                AgentPanelRow::Entry { entry_idx: 0 },
+                AgentPanelRow::Entry { entry_idx: 1 },
+            ]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, AgentPanelRow::Header { .. })));
+    }
+
+    #[test]
+    fn collapsed_agent_tag_group_hides_members_but_keeps_header() {
+        let mut app = tagged_agent_app(&[
+            ("a", Some("research"), AgentState::Idle, true),
+            ("c", Some("research"), AgentState::Idle, true),
+            ("b", None, AgentState::Idle, true),
+        ]);
+        app.collapsed_space_keys
+            .insert(agent_tag_collapse_key("research"));
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        assert_eq!(
+            rows,
+            vec![
+                AgentPanelRow::Header {
+                    tag: "research".to_string(),
+                    count: 2,
+                    collapsed: true,
+                    need: Some(NeedLevel::Idle),
+                },
+                AgentPanelRow::Entry { entry_idx: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_tag_header_rolls_up_the_strongest_member_state() {
+        // One research agent is blocked, the other idle-seen: the header's rolled
+        // up need is Blocked, the strongest across the members. A separate teaching
+        // agent that is idle-and-unseen rolls up to NeedsYou.
+        let app = tagged_agent_app(&[
+            ("a", Some("research"), AgentState::Idle, true),
+            ("b", Some("research"), AgentState::Blocked, true),
+            ("c", Some("teaching"), AgentState::Idle, false),
+        ]);
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        let needs: Vec<(&str, Option<NeedLevel>)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                AgentPanelRow::Header { tag, need, .. } => Some((tag.as_str(), *need)),
+                AgentPanelRow::Entry { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            needs,
+            vec![
+                ("research", Some(NeedLevel::Blocked)),
+                ("teaching", Some(NeedLevel::NeedsYou)),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_tag_group_collapse_key_is_distinct_from_the_spaces_key() {
+        assert_eq!(agent_tag_collapse_key("research"), "agent-tag:research");
+        assert_ne!(
+            agent_tag_collapse_key("research"),
+            tag_collapse_key("research")
+        );
+    }
+
+    #[test]
+    fn agent_panel_renders_tag_headers_above_their_member_rows() {
+        let app = tagged_agent_app(&[
+            ("alpha", Some("research"), AgentState::Idle, true),
+            ("bravo", None, AgentState::Idle, true),
+        ]);
+        let area = Rect::new(0, 0, 30, 24);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let body = agent_panel_body_rect(agent_area, false);
+
+        // The first body row is the research header (chevron + tag name), the
+        // agent row for "alpha" follows below it.
+        let header = row_text(buffer, body.y, area.width);
+        assert!(
+            header.contains("research"),
+            "expected tag header, got {header:?}"
+        );
+        assert!(
+            header.contains("▾"),
+            "expected open chevron, got {header:?}"
+        );
+        let member = row_text(buffer, body.y + 1, area.width);
+        assert!(
+            member.contains("alpha"),
+            "expected member row, got {member:?}"
+        );
     }
 
     #[test]

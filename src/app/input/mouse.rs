@@ -646,6 +646,17 @@ impl AppState {
                         return None;
                     }
 
+                    if let Some(tag) = self.agent_tag_header_at(mouse.row) {
+                        let key = crate::ui::agent_tag_collapse_key(&tag);
+                        if self.collapsed_space_keys.contains(&key) {
+                            self.collapsed_space_keys.remove(&key);
+                        } else {
+                            self.collapsed_space_keys.insert(key);
+                        }
+                        self.mark_session_dirty();
+                        return None;
+                    }
+
                     if let Some((ws_idx, _tab_idx, pane_id)) =
                         self.agent_detail_target_at(mouse.row)
                     {

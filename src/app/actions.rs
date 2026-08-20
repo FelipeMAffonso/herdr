@@ -1567,11 +1567,20 @@ impl AppState {
             self.view.sidebar_rect,
             self.sidebar_section_split,
         );
+        // `idx` is an index into `agent_panel_entries`; the scroll math indexes
+        // the interleaved header+entry display list, so map through it first. A
+        // hidden (collapsed-group) entry has no visible row to scroll to.
+        let entries = crate::ui::agent_panel_entries(self);
+        let display_rows = crate::ui::agent_panel_display_rows(self, &entries);
+        let Some(target_row) = crate::ui::agent_panel_display_row_for_entry(&display_rows, idx)
+        else {
+            return;
+        };
         self.agent_panel_scroll = crate::ui::agent_panel_scroll_for_target(
             self,
             detail_area,
             self.agent_panel_scroll,
-            idx,
+            target_row,
         );
     }
 
