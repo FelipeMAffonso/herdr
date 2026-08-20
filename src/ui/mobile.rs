@@ -1303,7 +1303,7 @@ mod tests {
         let (frame, rest) = working
             .split_once(' ')
             .expect("working segment has a leading symbol");
-        assert!(super::status::WORKING_SPINNER_FRAMES.contains(&frame));
+        assert!(crate::ui::status::WORKING_SPINNER_FRAMES.contains(&frame));
         assert_eq!(rest, "2 working");
     }
 
