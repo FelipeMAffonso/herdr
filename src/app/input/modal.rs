@@ -1514,14 +1514,14 @@ mod tests {
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,
                 tab_idx: 0,
-                pane_id: crate::layout::PaneId(1),
+                pane_id: crate::layout::PaneId::alloc(),
                 source_pane_id: None,
                 has_manual_label: false,
                 right_click_passthrough: false,
             },
             x: 0,
             y: 0,
-            list: MenuListState::default(),
+            list: MenuListState::new(0),
         };
         let items = menu.items();
         assert!(items.contains(&"Paste"));
