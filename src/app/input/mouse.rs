@@ -3602,15 +3602,23 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        app.state.context_menu = Some(ContextMenuState {
+        let mut menu = ContextMenuState {
             kind: ContextMenuKind::Workspace {
                 ws_idx: 1,
                 has_tag: false,
             },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
-        });
+            list: MenuListState::new(0),
+        };
+        // Select "Close" by label so menu growth cannot shift the target.
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("workspace menu should carry Close");
+        menu.list = MenuListState::new(close_idx);
+        app.state.context_menu = Some(menu);
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
             &mut app.state,
@@ -3645,22 +3653,29 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.confirm_close = false;
-        app.state.context_menu = Some(ContextMenuState {
+        let state_menu = ContextMenuState {
             kind: ContextMenuKind::Workspace {
                 ws_idx: 1,
                 has_tag: false,
             },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
-        });
+            list: MenuListState::new(0),
+        };
+        // Click the "Close" row by label so menu growth cannot shift the target.
+        let close_idx = state_menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("workspace menu should carry Close") as u16;
+        app.state.context_menu = Some(state_menu);
         app.state.mode = Mode::ContextMenu;
 
         let menu = app.state.context_menu_rect().unwrap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 2,
+            menu.y + 1 + close_idx,
         ));
 
         assert_eq!(app.state.workspaces.len(), 1);
