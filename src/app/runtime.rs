@@ -316,9 +316,9 @@ impl App {
     /// the tick needs to do. Shared by the interactive and headless loops so the
     /// 120ms cadence and active-only re-arm live in exactly one place.
     pub(crate) fn tick_sidebar_animation(&mut self, now: Instant) -> bool {
-        if !self
+        if self
             .next_sidebar_animation
-            .is_some_and(|deadline| now >= deadline)
+            .is_none_or(|deadline| now < deadline)
         {
             return false;
         }
