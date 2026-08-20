@@ -3863,4 +3863,108 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert_eq!(working_edge.symbol(), " ");
         assert_ne!(working_edge.style().fg, Some(app.palette.green));
     }
+
+    #[test]
+    fn top_level_space_with_a_branch_draws_its_second_line() {
+        // Regression guard: a top-level (ungrouped, non-worktree-child) space whose
+        // config carries a branch row must render that branch on a second line. The
+        // whole chain runs for real - compute_workspace_card_areas derives the card
+        // height from space_rows, and render_workspace_list draws each resolved row -
+        // so a card truncated to one line (the tag-grouping regression) is caught here.
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("repo");
+        ws.cached_git_branch = Some("feature-branch".into());
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        // The default spaces layout is [[state_icon, workspace], [branch, git_status]].
+        assert_eq!(app.sidebar_spaces.rows.len(), 2);
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let card = app.view.workspace_card_areas[0].rect;
+        assert!(
+            card.height >= 2,
+            "a space with a branch must get a card at least two rows tall, got {}",
+            card.height
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let second_line = row_text(buffer, card.y + 1, area.width);
+        assert!(
+            second_line.contains("feature-branch"),
+            "second card line should carry the branch, got {second_line:?}"
+        );
+    }
+
+    #[test]
+    fn felipe_three_row_space_layout_draws_branch_and_usage_lines() {
+        // Reproduces Felipe's live [ui.sidebar.spaces] layout verbatim -
+        // [[state_icon, workspace(styled)], [branch, git_status], [$usage]] - for a
+        // plain top-level space carrying a branch and a $usage token. All three rows
+        // must survive: the card is three tall and the branch and usage each land on
+        // their own line. Guards the post-swap regression where every space collapsed
+        // to a single line.
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_spaces = crate::config::SpacesSidebarConfig {
+            rows: vec![
+                vec![
+                    crate::config::SpaceSidebarToken::StateIcon,
+                    crate::config::SpaceSidebarToken::Styled {
+                        token: Box::new(crate::config::SpaceSidebarToken::Workspace),
+                        style: crate::config::SidebarTokenStyle::default(),
+                    },
+                ],
+                vec![
+                    crate::config::SpaceSidebarToken::Branch,
+                    crate::config::SpaceSidebarToken::GitStatus,
+                ],
+                vec![crate::config::SpaceSidebarToken::Custom("usage".into())],
+            ],
+            row_gap: 0,
+        };
+        let mut ws = Workspace::test_new("repo");
+        ws.cached_git_branch = Some("mainline".into());
+        ws.metadata_tokens.patch(
+            std::collections::HashMap::from([("usage".to_string(), Some("42%".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let card = app.view.workspace_card_areas[0].rect;
+        assert_eq!(
+            card.height, 3,
+            "the three-row layout must yield a three-row-tall card"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let branch_line = row_text(buffer, card.y + 1, area.width);
+        assert!(
+            branch_line.contains("mainline"),
+            "second card line should carry the branch, got {branch_line:?}"
+        );
+        let usage_line = row_text(buffer, card.y + 2, area.width);
+        assert!(
+            usage_line.contains("42%"),
+            "third card line should carry the usage token, got {usage_line:?}"
+        );
+    }
 }
