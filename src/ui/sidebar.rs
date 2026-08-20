@@ -536,7 +536,12 @@ pub(crate) enum TagLayoutRow {
         /// name stays resolvable even when the group is collapsed.
         first_ws_idx: usize,
     },
-    Entry(WorkspaceListEntry),
+    Entry {
+        entry: WorkspaceListEntry,
+        /// True when this entry belongs under a tag group header, so its card
+        /// indents two cells beneath the header. Untagged rows stay at column 0.
+        grouped: bool,
+    },
 }
 
 /// Split a worktree-grouped entry list into top-level blocks, where each block is
@@ -607,14 +612,20 @@ pub(crate) fn tag_layout_rows(app: &AppState) -> Vec<TagLayoutRow> {
         }
         for block_idx in &group.member_entry_indices {
             for entry in &blocks[*block_idx] {
-                rows.push(TagLayoutRow::Entry(entry.clone()));
+                rows.push(TagLayoutRow::Entry {
+                    entry: entry.clone(),
+                    grouped: true,
+                });
             }
         }
     }
 
     for block_idx in &grouping.ungrouped {
         for entry in &blocks[*block_idx] {
-            rows.push(TagLayoutRow::Entry(entry.clone()));
+            rows.push(TagLayoutRow::Entry {
+                entry: entry.clone(),
+                grouped: false,
+            });
         }
     }
 
@@ -632,7 +643,10 @@ pub(crate) fn workspace_display_order(app: &AppState) -> Vec<usize> {
     workspace_display_rows(app)
         .into_iter()
         .filter_map(|row| match row {
-            TagLayoutRow::Entry(WorkspaceListEntry::Workspace { ws_idx, .. }) => Some(ws_idx),
+            TagLayoutRow::Entry {
+                entry: WorkspaceListEntry::Workspace { ws_idx, .. },
+                ..
+            } => Some(ws_idx),
             TagLayoutRow::Header { .. } => None,
         })
         .collect()
@@ -644,8 +658,10 @@ pub(crate) fn workspace_display_row_index(app: &AppState, ws_idx: usize) -> Opti
     workspace_display_rows(app).iter().position(|row| {
         matches!(
             row,
-            TagLayoutRow::Entry(WorkspaceListEntry::Workspace { ws_idx: entry_idx, .. })
-                if *entry_idx == ws_idx
+            TagLayoutRow::Entry {
+                entry: WorkspaceListEntry::Workspace { ws_idx: entry_idx, .. },
+                ..
+            } if *entry_idx == ws_idx
         )
     })
 }
@@ -659,7 +675,10 @@ fn workspace_display_rows(app: &AppState) -> Vec<TagLayoutRow> {
     } else {
         workspace_list_entries(app)
             .into_iter()
-            .map(TagLayoutRow::Entry)
+            .map(|entry| TagLayoutRow::Entry {
+                entry,
+                grouped: false,
+            })
             .collect()
     }
 }
@@ -668,7 +687,10 @@ fn workspace_display_rows(app: &AppState) -> Vec<TagLayoutRow> {
 fn display_row_height(app: &AppState, row: &TagLayoutRow, body_height: u16) -> u16 {
     match row {
         TagLayoutRow::Header { .. } => 1u16.min(body_height),
-        TagLayoutRow::Entry(WorkspaceListEntry::Workspace { ws_idx, indented }) => app
+        TagLayoutRow::Entry {
+            entry: WorkspaceListEntry::Workspace { ws_idx, indented },
+            ..
+        } => app
             .workspaces
             .get(*ws_idx)
             .map(|ws| workspace_row_height_in_body(app, ws, *indented, body_height))
@@ -681,10 +703,10 @@ fn display_row_height(app: &AppState, row: &TagLayoutRow, body_height: u16) -> u
 fn display_row_gap(app: &AppState, rows: &[TagLayoutRow], idx: usize) -> u16 {
     let next_is_indented_child = matches!(
         rows.get(idx.saturating_add(1)),
-        Some(TagLayoutRow::Entry(WorkspaceListEntry::Workspace {
-            indented: true,
+        Some(TagLayoutRow::Entry {
+            entry: WorkspaceListEntry::Workspace { indented: true, .. },
             ..
-        }))
+        })
     );
     let is_header = matches!(rows.get(idx), Some(TagLayoutRow::Header { .. }));
     if idx + 1 < rows.len() && !next_is_indented_child && !is_header {
@@ -923,13 +945,16 @@ pub(crate) fn compute_workspace_list_areas(
 
     let rows = workspace_display_rows(app);
     for (row_idx, row) in rows.iter().enumerate().skip(scroll) {
-        let (ws_idx, indented, is_tag_header) = match row {
-            TagLayoutRow::Header { first_ws_idx, .. } => (*first_ws_idx, false, true),
-            TagLayoutRow::Entry(WorkspaceListEntry::Workspace { ws_idx, indented }) => {
+        let (ws_idx, indented, is_tag_header, grouped) = match row {
+            TagLayoutRow::Header { first_ws_idx, .. } => (*first_ws_idx, false, true, false),
+            TagLayoutRow::Entry {
+                entry: WorkspaceListEntry::Workspace { ws_idx, indented },
+                grouped,
+            } => {
                 if app.workspaces.get(*ws_idx).is_none() {
                     continue;
                 }
-                (*ws_idx, *indented, false)
+                (*ws_idx, *indented, false, *grouped)
             }
         };
         let row_height = display_row_height(app, row, body.height);
@@ -937,9 +962,16 @@ pub(crate) fn compute_workspace_list_areas(
         if row_y.saturating_add(row_height) > body_bottom {
             break;
         }
+        // A tag-group member card indents two cells under its header; everything
+        // drawn inside the card (state icon, name, rollup edge) rides the shift.
+        let (card_x, card_width) = if grouped {
+            (body.x.saturating_add(2), body.width.saturating_sub(2))
+        } else {
+            (body.x, body.width)
+        };
         cards.push(crate::app::state::WorkspaceCardArea {
             ws_idx,
-            rect: Rect::new(body.x, row_y, body.width, row_height),
+            rect: Rect::new(card_x, row_y, card_width, row_height),
             indented,
             is_tag_header,
         });
@@ -3607,28 +3639,40 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                     collapsed: false,
                     first_ws_idx: 0,
                 },
-                TagLayoutRow::Entry(WorkspaceListEntry::Workspace {
-                    ws_idx: 0,
-                    indented: false,
-                }),
-                TagLayoutRow::Entry(WorkspaceListEntry::Workspace {
-                    ws_idx: 2,
-                    indented: false,
-                }),
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 0,
+                        indented: false,
+                    },
+                    grouped: true,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 2,
+                        indented: false,
+                    },
+                    grouped: true,
+                },
                 TagLayoutRow::Header {
                     tag: "teaching".to_string(),
                     count: 1,
                     collapsed: false,
                     first_ws_idx: 3,
                 },
-                TagLayoutRow::Entry(WorkspaceListEntry::Workspace {
-                    ws_idx: 3,
-                    indented: false,
-                }),
-                TagLayoutRow::Entry(WorkspaceListEntry::Workspace {
-                    ws_idx: 1,
-                    indented: false,
-                }),
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 3,
+                        indented: false,
+                    },
+                    grouped: true,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 1,
+                        indented: false,
+                    },
+                    grouped: false,
+                },
             ]
         );
     }
@@ -3655,13 +3699,42 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                     collapsed: true,
                     first_ws_idx: 0,
                 },
-                TagLayoutRow::Entry(WorkspaceListEntry::Workspace {
-                    ws_idx: 2,
-                    indented: false,
-                }),
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 2,
+                        indented: false,
+                    },
+                    grouped: false,
+                },
             ]
         );
         assert_eq!(workspace_display_order(&app), vec![2]);
+    }
+
+    #[test]
+    fn grouped_member_card_indents_two_cells_untagged_stays_at_column_zero() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("research")),
+            tagged_workspace("b", None),
+        ];
+
+        let area = Rect::new(0, 0, 30, 20);
+        let body =
+            workspace_list_body_rect(workspace_list_rect(area, app.sidebar_section_split), false);
+        let (cards, _) = compute_workspace_list_areas(&app, area);
+
+        // header (ws 0), grouped member (ws 0), untagged remainder (ws 1).
+        let grouped = cards
+            .iter()
+            .find(|c| c.ws_idx == 0 && !c.is_tag_header)
+            .unwrap();
+        let untagged = cards.iter().find(|c| c.ws_idx == 1).unwrap();
+
+        assert_eq!(grouped.rect.x, body.x + 2);
+        assert_eq!(grouped.rect.width, body.width - 2);
+        assert_eq!(untagged.rect.x, body.x);
+        assert_eq!(untagged.rect.width, body.width);
     }
 
     #[test]
