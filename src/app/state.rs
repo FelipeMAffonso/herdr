@@ -1264,6 +1264,9 @@ impl ContextMenuState {
                 if source_pane_id.is_some() {
                     items.push("Swap with focused pane");
                 }
+                // Smart paste: routes by clipboard content - copied files paste as
+                // quoted paths, a snipped image as a temp-file path, text as itself.
+                items.push("Paste");
                 items.extend(["Split right", "Split down", "Zoom"]);
                 items.push(if right_click_passthrough {
                     "Use Herdr right-click menu"

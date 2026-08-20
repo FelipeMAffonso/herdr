@@ -1338,6 +1338,26 @@ impl App {
                 ContextMenuKind::Pane {
                     ws_idx, pane_id, ..
                 },
+                Some("Paste"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                if let Some(text) = smart_clipboard_paste_text() {
+                    if let Some(public_id) = self.public_pane_id(ws_idx, pane_id) {
+                        self.runtime_pane_send_text(
+                            "tui.pane.send_text",
+                            crate::api::schema::PaneSendTextParams {
+                                pane_id: public_id,
+                                text,
+                            },
+                        );
+                    }
+                }
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::Pane {
+                    ws_idx, pane_id, ..
+                },
                 Some("Split right"),
             ) => {
                 self.focus_pane_internal_via_api(ws_idx, pane_id);
@@ -1384,6 +1404,48 @@ impl App {
     }
 }
 
+/// The pane menu's smart Paste: route by clipboard content, richest format first.
+/// Copied files paste as their quoted paths, a snipped image lands in a temp file
+/// and pastes as that file's path (agents read paths), and plain text pastes as
+/// itself. Returns None when the clipboard has nothing usable.
+fn smart_clipboard_paste_text() -> Option<String> {
+    if let Some(paths) = crate::platform::read_clipboard_file_paths() {
+        return Some(quote_paths_for_paste(&paths));
+    }
+    if let Some(image) = crate::platform::read_clipboard_image() {
+        if let Some(path) = save_clipboard_image_for_paste(&image) {
+            return Some(path);
+        }
+    }
+    crate::platform::read_clipboard_text()
+}
+
+fn quote_paths_for_paste(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            if path.contains(' ') {
+                format!("\"{path}\"")
+            } else {
+                path.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn save_clipboard_image_for_paste(image: &crate::platform::ClipboardImage) -> Option<String> {
+    let dir = std::env::temp_dir().join("herdr-paste");
+    std::fs::create_dir_all(&dir).ok()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = dir.join(format!("paste-{stamp}.{}", image.extension));
+    std::fs::write(&path, &image.bytes).ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
 fn cancel_rename_modal(state: &mut AppState) {
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
@@ -1420,6 +1482,52 @@ mod tests {
 
     fn config_env_lock() -> &'static std::sync::Mutex<()> {
         crate::config::test_config_env_lock()
+    }
+
+    #[test]
+    fn copied_files_paste_as_paths_quoted_only_when_they_need_it() {
+        assert_eq!(
+            super::quote_paths_for_paste(&[
+                "C:\\src\\a.png".to_string(),
+                "C:\\Users\\felip\\my file.txt".to_string()
+            ]),
+            "C:\\src\\a.png \"C:\\Users\\felip\\my file.txt\""
+        );
+    }
+
+    #[test]
+    fn a_clipboard_image_lands_in_a_temp_file_whose_path_is_the_paste() {
+        let image = crate::platform::ClipboardImage {
+            bytes: b"\x89PNG\r\n\x1a\nfake".to_vec(),
+            extension: "png",
+        };
+        let path = super::save_clipboard_image_for_paste(&image).expect("temp save");
+        assert!(path.ends_with(".png"));
+        let written = std::fs::read(&path).expect("written bytes");
+        assert_eq!(written, image.bytes);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_pane_menu_offers_paste_between_swap_and_split() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: crate::layout::PaneId(1),
+                source_pane_id: None,
+                has_manual_label: false,
+                right_click_passthrough: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::default(),
+        };
+        let items = menu.items();
+        assert!(items.contains(&"Paste"));
+        let paste = items.iter().position(|i| *i == "Paste").unwrap();
+        let split = items.iter().position(|i| *i == "Split right").unwrap();
+        assert!(paste < split);
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {

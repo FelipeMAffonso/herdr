@@ -1891,10 +1891,6 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     }
 }
 
-pub fn read_clipboard_text() -> Option<String> {
-    None
-}
-
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     let operation = wide_null("open");
     let url = wide_null(url);
@@ -1947,6 +1943,100 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
         }
     }
     None
+}
+
+/// Upper bound for interactive clipboard text and file lists. Matches the input
+/// transport's order of magnitude; anything larger is not an interactive paste.
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 8 * 1024 * 1024;
+
+/// CF_HDROP, absent from the Ole imports above; a stable Win32 constant.
+const CF_HDROP_FORMAT: u32 = 15;
+
+/// The clipboard's plain text (CF_UNICODETEXT), for the pane Paste action.
+pub fn read_clipboard_text() -> Option<String> {
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            let bytes = clipboard_global_bytes(CF_UNICODETEXT as u32, MAX_CLIPBOARD_TEXT_BYTES)?;
+            return decode_wide_until_null(&bytes);
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    None
+}
+
+/// Files copied in Explorer (CF_HDROP), as their full paths - the pane Paste
+/// action pastes these quoted. Parsed without the shell API: the global block is
+/// a DROPFILES header (20 bytes: list offset at 0, wide flag at 16) followed by
+/// a double-null-terminated string list.
+pub fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            let bytes = clipboard_global_bytes(CF_HDROP_FORMAT, MAX_CLIPBOARD_TEXT_BYTES)?;
+            return parse_dropfiles(&bytes);
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    None
+}
+
+fn decode_wide_until_null(bytes: &[u8]) -> Option<String> {
+    let mut units = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    if units.is_empty() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
+fn parse_dropfiles(bytes: &[u8]) -> Option<Vec<String>> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    let offset = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let wide = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) != 0;
+    let list = bytes.get(offset..)?;
+    let mut paths = Vec::new();
+    if wide {
+        let mut units: Vec<u16> = Vec::new();
+        for chunk in list.chunks_exact(2) {
+            let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+            if unit == 0 {
+                if units.is_empty() {
+                    break; // the double null closing the list
+                }
+                paths.push(String::from_utf16_lossy(&units));
+                units.clear();
+            } else {
+                units.push(unit);
+            }
+        }
+    } else {
+        let mut current: Vec<u8> = Vec::new();
+        for &byte in list {
+            if byte == 0 {
+                if current.is_empty() {
+                    break;
+                }
+                paths.push(String::from_utf8_lossy(&current).into_owned());
+                current.clear();
+            } else {
+                current.push(byte);
+            }
+        }
+    }
+    if paths.is_empty() { None } else { Some(paths) }
 }
 
 fn read_registered_png_clipboard() -> Option<Vec<u8>> {
@@ -2526,6 +2616,45 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    #[test]
+    fn wide_clipboard_text_decodes_to_the_first_null() {
+        let mut bytes: Vec<u8> = Vec::new();
+        for unit in "hot sauce\r\nline two".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&u16::from(b'x').to_le_bytes()); // junk past the null
+        assert_eq!(
+            super::decode_wide_until_null(&bytes).as_deref(),
+            Some("hot sauce\r\nline two")
+        );
+        assert_eq!(super::decode_wide_until_null(&[0, 0]), None);
+    }
+
+    #[test]
+    fn dropfiles_block_yields_every_path_and_stops_at_the_double_null() {
+        // A DROPFILES header: list offset 20, point 0/0, fNC 0, fWide 1.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        for path in ["C:\\src\\a.png", "C:\\Users\\felip\\my file.txt"] {
+            for unit in path.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // the closing double null
+        assert_eq!(
+            super::parse_dropfiles(&bytes),
+            Some(vec![
+                "C:\\src\\a.png".to_string(),
+                "C:\\Users\\felip\\my file.txt".to_string()
+            ])
+        );
+        assert_eq!(super::parse_dropfiles(&[0u8; 8]), None);
+    }
 
     #[test]
     fn private_remote_directory_supports_long_paths() {
