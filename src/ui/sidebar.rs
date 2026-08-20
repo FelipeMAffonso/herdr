@@ -232,14 +232,6 @@ fn workspace_row_height_in_body(
     workspace_row_height(app, workspace, indented).min(body_height)
 }
 
-fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
-    if entry_idx + 1 < entries.len() && !next_entry_is_indented_workspace(entries, entry_idx) {
-        app.sidebar_spaces.row_gap
-    } else {
-        0
-    }
-}
-
 fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
