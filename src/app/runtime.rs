@@ -309,6 +309,25 @@ impl App {
         }
     }
 
+    /// If the sidebar animation timer is due, fire it: request a redraw and
+    /// re-arm only while there is still something animating, otherwise stop the
+    /// timer. Returns true when it fired (the caller must redraw). The spinner
+    /// frame and waiting counters are derived at render time, so a redraw is all
+    /// the tick needs to do. Shared by the interactive and headless loops so the
+    /// 120ms cadence and active-only re-arm live in exactly one place.
+    pub(crate) fn tick_sidebar_animation(&mut self, now: Instant) -> bool {
+        if !self
+            .next_sidebar_animation
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return false;
+        }
+        self.next_sidebar_animation = self
+            .sidebar_animation_active()
+            .then(|| now + SIDEBAR_ANIMATION_INTERVAL);
+        true
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
@@ -319,18 +338,7 @@ impl App {
             self.next_resize_poll = now + RESIZE_POLL_INTERVAL;
         }
 
-        if self
-            .next_sidebar_animation
-            .is_some_and(|deadline| now >= deadline)
-        {
-            // The spinner frame and waiting counters are derived at render time,
-            // so a redraw is all this tick needs to do. Re-arm only while there is
-            // still something animating; otherwise stop the timer entirely.
-            changed = true;
-            self.next_sidebar_animation = self
-                .sidebar_animation_active()
-                .then(|| now + SIDEBAR_ANIMATION_INTERVAL);
-        }
+        changed |= self.tick_sidebar_animation(now);
 
         if self
             .config_diagnostic_deadline
