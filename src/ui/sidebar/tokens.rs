@@ -109,7 +109,7 @@ pub(super) fn agent_rows(
                             seen: entry.seen,
                         }),
                         AgentSidebarToken::Waiting => needs_attention(entry.state, entry.seen)
-                            .then(|| entry.last_agent_state_change_at)
+                            .then_some(entry.last_agent_state_change_at)
                             .flatten()
                             .map(|at| ResolvedTokenKind::Waiting {
                                 text: waiting_text(at.elapsed()),
