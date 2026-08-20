@@ -125,7 +125,12 @@ pub(super) fn agent_rows(
                     Some(ResolvedToken::new(kind, style))
                 })
                 .collect::<Vec<_>>();
-            (!resolved.is_empty()).then_some(resolved)
+            // The need edge is a gutter, not content: a row carrying nothing
+            // else (e.g. [need_edge, waiting] while the agent works) elides.
+            let has_content = resolved
+                .iter()
+                .any(|token| !matches!(token.kind, ResolvedTokenKind::NeedEdge { .. }));
+            has_content.then_some(resolved)
         })
         .collect()
 }
