@@ -1712,6 +1712,13 @@ fn render_workspace_list(
             },
         );
 
+        // Leading attention edge for this row, colored by the workspace's own
+        // rolled-up need exactly as the tag-group headers color theirs. Top-level
+        // rows (grouped tag members included) carry it in their first cell, which
+        // was previously blank pad, so nothing shifts. Worktree children keep their
+        // tree-connector column untouched and take no edge.
+        let row_edge = tag_group_edge(need_rollup(&[(agg_state, agg_seen)]), p);
+
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
                 break;
@@ -1734,10 +1741,13 @@ fn render_workspace_list(
                     8
                 }
             } else if row_index == 0 {
-                spans.push(Span::raw(" "));
+                // Edge in the first cell, in place of the one-cell pad.
+                spans.push(row_edge.clone());
                 1
             } else {
-                spans.push(Span::raw("   "));
+                // Edge spans the row's later lines too, keeping the two-cell pad.
+                spans.push(row_edge.clone());
+                spans.push(Span::raw("  "));
                 3
             };
             let trailing_width = if row_index == 0 && parent_group.is_some() {
@@ -3801,5 +3811,56 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         );
         // Unknown-only rolls up to nothing.
         assert_eq!(need_rollup(&[(AgentState::Unknown, true)]), None);
+    }
+
+    #[test]
+    fn workspace_rows_carry_a_need_edge_colored_by_their_own_rollup() {
+        // Two top-level spaces: the first finished and unseen (needs you), the
+        // second actively working. The row's first cell should carry the green
+        // edge for the first and a blank cell for the second, mirroring how the
+        // tag-group headers color their leading edge.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("needsyou"),
+            Workspace::test_new("working"),
+        ];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        let set_state = |app: &mut crate::app::state::AppState, ws_idx: usize, state, seen| {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&terminal_id).unwrap().state = state;
+            app.workspaces[ws_idx].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = seen;
+        };
+        // Idle + unseen rolls up to NeedsYou (green); Working rolls up to no edge.
+        set_state(&mut app, 0, AgentState::Idle, false);
+        set_state(&mut app, 1, AgentState::Working, true);
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let needs_you = app.view.workspace_card_areas[0].rect;
+        let working = app.view.workspace_card_areas[1].rect;
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let needs_you_edge = &buffer[(needs_you.x, needs_you.y)];
+        assert_eq!(needs_you_edge.symbol(), "▎");
+        assert_eq!(needs_you_edge.style().fg, Some(app.palette.green));
+
+        let working_edge = &buffer[(working.x, working.y)];
+        assert_eq!(working_edge.symbol(), " ");
+        assert_ne!(working_edge.style().fg, Some(app.palette.green));
     }
 }
