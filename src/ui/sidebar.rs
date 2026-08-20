@@ -195,6 +195,22 @@ pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static 
     }
 }
 
+/// (total known agents in a space, how many need attention). A pane counts as an
+/// agent when it resolves to a known agent kind; it needs attention when it is
+/// blocked or finished-and-unseen (the same rule the agent panel uses). Drives the
+/// `agents` space token's "N agents · M need you" summary.
+fn workspace_agent_summary(app: &AppState, ws: &crate::workspace::Workspace) -> (usize, usize) {
+    ws.pane_details(&app.terminals)
+        .iter()
+        .filter(|detail| detail.agent.is_some())
+        .fold((0usize, 0usize), |(total, needs_you), detail| {
+            (
+                total + 1,
+                needs_you + usize::from(tokens::needs_attention(detail.state, detail.seen)),
+            )
+        })
+}
+
 fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indented: bool) -> u16 {
     let (state, seen) = ws.aggregate_state(&app.terminals);
     let label = if indented {
@@ -216,6 +232,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             ahead_behind: ws.git_ahead_behind(),
             tokens: &token_values,
             suppress_git_details: indented,
+            agents: workspace_agent_summary(app, ws),
         },
     )
     .len()
@@ -1322,6 +1339,7 @@ fn resolved_token_spans(
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::TerminalTitle(text)
             | ResolvedTokenKind::Branch(text)
+            | ResolvedTokenKind::SpaceAgents(text)
             | ResolvedTokenKind::Waiting { text, .. }
             | ResolvedTokenKind::Custom(text) => display_width(text),
             _ => 0,
@@ -1483,7 +1501,9 @@ fn resolved_token_spans(
                     ),
                 ));
             }
-            ResolvedTokenKind::TerminalTitle(text) | ResolvedTokenKind::Custom(text) => {
+            ResolvedTokenKind::TerminalTitle(text)
+            | ResolvedTokenKind::SpaceAgents(text)
+            | ResolvedTokenKind::Custom(text) => {
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
                     apply_token_style(custom_style, token.style),
@@ -1709,6 +1729,7 @@ fn render_workspace_list(
                 ahead_behind: ws.git_ahead_behind(),
                 tokens: &token_values,
                 suppress_git_details: card.indented,
+                agents: workspace_agent_summary(app, ws),
             },
         );
 
@@ -3965,6 +3986,52 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         assert!(
             usage_line.contains("42%"),
             "third card line should carry the usage token, got {usage_line:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_space_still_draws_its_branch_line_under_the_group_indent() {
+        // A tagged workspace routes through tag_layout_rows and gets the two-cell
+        // group indent (compute_workspace_list_areas shifts a grouped card x+2,
+        // width-2). Confirm that indent does not swallow the second (branch) line:
+        // the card stays two rows tall and the branch still renders on line two,
+        // shifted right by the indent.
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("repo");
+        ws.cached_git_branch = Some("mainline".into());
+        ws.set_tag(Some("teaching".into()));
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        assert!(has_tag_groups(&app), "the workspace should be tagged");
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        // Card 0 is the tag header; card 1 is the workspace itself.
+        let ws_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| !card.is_tag_header)
+            .expect("a workspace card")
+            .rect;
+        assert_eq!(
+            ws_card.height, 2,
+            "the two-row layout must survive the group indent"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let branch_line = row_text(buffer, ws_card.y + 1, area.width);
+        assert!(
+            branch_line.contains("mainline"),
+            "second card line should carry the branch even when grouped, got {branch_line:?}"
         );
     }
 }

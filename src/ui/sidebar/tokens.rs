@@ -24,6 +24,8 @@ pub(super) enum ResolvedTokenKind {
         ahead: usize,
         behind: usize,
     },
+    /// The rendered agent summary for a space, e.g. "3 agents · 1 need you".
+    SpaceAgents(String),
     NeedEdge {
         state: crate::detect::AgentState,
         seen: bool,
@@ -142,6 +144,25 @@ pub(super) struct SpaceTokenContext<'a> {
     pub ahead_behind: Option<(usize, usize)>,
     pub tokens: &'a std::collections::HashMap<String, String>,
     pub suppress_git_details: bool,
+    /// (total known agents in this space, how many need attention). The `agents`
+    /// token renders "N agents" plus "· M need you" when M > 0, and its row elides
+    /// when total is 0.
+    pub agents: (usize, usize),
+}
+
+/// One-line agent summary for a space: "N agents", with "· M need you" appended
+/// when M of them are blocked or finished-and-unseen. `None` when the space has no
+/// known agents, so the `agents` row elides.
+fn agent_summary_text(total: usize, needs_you: usize) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let noun = if total == 1 { "agent" } else { "agents" };
+    let mut summary = format!("{total} {noun}");
+    if needs_you > 0 {
+        summary.push_str(&format!(" · {needs_you} need you"));
+    }
+    Some(summary)
 }
 
 pub(super) fn space_rows(
@@ -173,6 +194,10 @@ pub(super) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        SpaceSidebarToken::Agents => {
+                            agent_summary_text(context.agents.0, context.agents.1)
+                                .map(ResolvedTokenKind::SpaceAgents)
+                        }
                         SpaceSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -414,6 +439,7 @@ mod tests {
                     ahead_behind: Some((2, 1)),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    agents: (0, 0),
                 },
             ),
             vec![vec![
@@ -441,11 +467,83 @@ mod tests {
                     ahead_behind: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    agents: (0, 0),
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
                 "2 changes".into()
             ))]]
+        );
+    }
+
+    fn agents_config() -> SpacesSidebarConfig {
+        SpacesSidebarConfig {
+            rows: vec![vec![SpaceSidebarToken::Agents]],
+            ..Default::default()
+        }
+    }
+
+    fn agents_context(agents: (usize, usize)) -> SpaceTokenContext<'static> {
+        SpaceTokenContext {
+            workspace: "repo",
+            branch: None,
+            state_text: "idle",
+            ahead_behind: None,
+            tokens: EMPTY_TOKENS.get_or_init(std::collections::HashMap::new),
+            suppress_git_details: false,
+            agents,
+        }
+    }
+
+    static EMPTY_TOKENS: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+
+    #[test]
+    fn agents_token_elides_when_the_space_has_no_agents() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((0, 0))),
+            Vec::<Vec<ResolvedToken>>::new()
+        );
+    }
+
+    #[test]
+    fn agents_token_summarizes_a_count_with_no_attention_needed() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((3, 0))),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::SpaceAgents("3 agents".into())
+            )]]
+        );
+    }
+
+    #[test]
+    fn agents_token_appends_the_needs_you_count() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((3, 1))),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::SpaceAgents("3 agents · 1 need you".into())
+            )]]
+        );
+    }
+
+    #[test]
+    fn agents_token_uses_the_singular_noun_for_one_agent() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((1, 1))),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::SpaceAgents("1 agent · 1 need you".into())
+            )]]
+        );
+    }
+
+    #[test]
+    fn agent_summary_text_covers_singular_plural_and_empty() {
+        assert_eq!(agent_summary_text(0, 0), None);
+        assert_eq!(agent_summary_text(1, 0).as_deref(), Some("1 agent"));
+        assert_eq!(agent_summary_text(2, 0).as_deref(), Some("2 agents"));
+        assert_eq!(
+            agent_summary_text(4, 2).as_deref(),
+            Some("4 agents · 2 need you")
         );
     }
 }

@@ -131,6 +131,10 @@ pub enum SpaceSidebarToken {
     Workspace,
     Branch,
     GitStatus,
+    /// A one-line summary of the agents living in this space: "N agents", with
+    /// "· M need you" appended when M of them are blocked or finished-and-unseen.
+    /// Elides (the row drops) when the space has no known agents.
+    Agents,
     Custom(String),
     Styled {
         token: Box<SpaceSidebarToken>,
@@ -261,6 +265,7 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
+        SpaceSidebarToken::Agents => "agents".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
         SpaceSidebarToken::Styled { token, .. } => space_token_name(token),
     }
@@ -349,6 +354,7 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
+                ("agents", Self::Agents),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -522,6 +528,23 @@ row_gap = 3
             vec![SpaceSidebarToken::Custom("jj_status".into())]
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
+    }
+
+    #[test]
+    fn parses_and_serializes_the_agents_space_token() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["agents"]]
+"#,
+        )
+        .expect("agents space token config");
+
+        assert_eq!(
+            config.ui.sidebar.spaces.rows[1],
+            vec![SpaceSidebarToken::Agents]
+        );
+        assert_eq!(space_token_name(&SpaceSidebarToken::Agents), "agents");
     }
 
     #[test]
