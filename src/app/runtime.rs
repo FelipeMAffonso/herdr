@@ -7,7 +7,7 @@ use crossterm::terminal;
 
 use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
-    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL, SIDEBAR_ANIMATION_INTERVAL,
 };
 fn retain_detached_process_after_wait(
     pid: u32,
@@ -287,6 +287,28 @@ impl App {
         false
     }
 
+    /// True while the sidebar has something worth re-rendering on a timer: an
+    /// agent actively working (the spinner animates) or an agent needing
+    /// attention (blocked, or done-and-unseen — the waiting counters refresh).
+    pub(crate) fn sidebar_animation_active(&self) -> bool {
+        self.state.workspaces.iter().any(|ws| {
+            matches!(
+                ws.aggregate_state(&self.state.terminals),
+                (crate::detect::AgentState::Working, _)
+                    | (crate::detect::AgentState::Blocked, _)
+                    | (crate::detect::AgentState::Idle, false)
+            )
+        })
+    }
+
+    /// Arm the sidebar animation timer if it is not already running and there is
+    /// something to animate. Called when a pane state change lands.
+    pub(crate) fn arm_sidebar_animation(&mut self, now: Instant) {
+        if self.next_sidebar_animation.is_none() && self.sidebar_animation_active() {
+            self.next_sidebar_animation = Some(now);
+        }
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
@@ -295,6 +317,19 @@ impl App {
             resized = self.handle_resize_poll();
             changed |= resized;
             self.next_resize_poll = now + RESIZE_POLL_INTERVAL;
+        }
+
+        if self
+            .next_sidebar_animation
+            .is_some_and(|deadline| now >= deadline)
+        {
+            // The spinner frame and waiting counters are derived at render time,
+            // so a redraw is all this tick needs to do. Re-arm only while there is
+            // still something animating; otherwise stop the timer entirely.
+            changed = true;
+            self.next_sidebar_animation = self
+                .sidebar_animation_active()
+                .then(|| now + SIDEBAR_ANIMATION_INTERVAL);
         }
 
         if self
@@ -612,6 +647,7 @@ impl App {
 
         [
             include_resize_poll.then_some(self.next_resize_poll),
+            self.next_sidebar_animation,
             self.config_diagnostic_deadline,
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),

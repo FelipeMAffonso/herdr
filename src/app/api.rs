@@ -610,6 +610,9 @@ impl App {
     }
 
     pub(crate) fn emit_pane_state_update(&mut self, update: &crate::app::actions::PaneStateUpdate) {
+        // A pane state change may have started an agent working or left one
+        // needing attention: arm the sidebar animation timer if it is idle.
+        self.arm_sidebar_animation(Instant::now());
         let Some(pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
             return;
         };

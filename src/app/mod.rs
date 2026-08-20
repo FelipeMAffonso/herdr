@@ -48,6 +48,9 @@ const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
+/// Redraw cadence for the sidebar's animated working spinner and the waiting
+/// counters. Re-arms only while an agent is working or needs attention.
+const SIDEBAR_ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -130,6 +133,10 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
+    /// When set, the next instant the sidebar working spinner / waiting counters
+    /// should re-render. Armed on a pane state change, re-armed while any agent is
+    /// working or needs attention, cleared to `None` when nothing needs animating.
+    pub(crate) next_sidebar_animation: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -563,6 +570,7 @@ impl App {
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
             tag_edit_target: None,
+            tag_rename_from: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
@@ -766,6 +774,7 @@ impl App {
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
+            next_sidebar_animation: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -4930,6 +4939,92 @@ mod tests {
             app.next_loop_deadline(now, false),
             app.session_save_deadline
         );
+    }
+
+    /// Give the workspace's root pane the given detected state so aggregate_state
+    /// resolves to it.
+    fn set_root_pane_state(app: &mut App, state: AgentState, seen: bool) {
+        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal_id).unwrap().state = state;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&root_pane)
+            .unwrap()
+            .seen = seen;
+    }
+
+    #[test]
+    fn sidebar_animation_active_tracks_working_and_attention() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+
+        set_root_pane_state(&mut app, AgentState::Idle, true);
+        assert!(!app.sidebar_animation_active());
+
+        set_root_pane_state(&mut app, AgentState::Working, true);
+        assert!(app.sidebar_animation_active());
+
+        // Done-and-unseen still needs the waiting counters to refresh.
+        set_root_pane_state(&mut app, AgentState::Idle, false);
+        assert!(app.sidebar_animation_active());
+
+        set_root_pane_state(&mut app, AgentState::Blocked, true);
+        assert!(app.sidebar_animation_active());
+    }
+
+    #[test]
+    fn next_loop_deadline_includes_sidebar_animation() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.next_sidebar_animation = Some(now + Duration::from_millis(50));
+        app.next_resize_poll = now + Duration::from_secs(5);
+        app.session_save_deadline = Some(now + Duration::from_secs(2));
+
+        assert_eq!(
+            app.next_loop_deadline(now, false),
+            app.next_sidebar_animation
+        );
+    }
+
+    #[test]
+    fn due_sidebar_animation_rearms_while_working_and_clears_when_idle() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+        set_root_pane_state(&mut app, AgentState::Working, true);
+
+        let now = Instant::now();
+        app.next_sidebar_animation = Some(now - Duration::from_millis(1));
+        assert!(app.handle_scheduled_tasks(now, false));
+        // Still working: the timer re-arms into the future.
+        let rearmed = app.next_sidebar_animation.expect("re-armed while working");
+        assert!(rearmed > now);
+
+        // Nothing to animate: the next firing clears the timer entirely.
+        set_root_pane_state(&mut app, AgentState::Idle, true);
+        let later = rearmed;
+        app.next_sidebar_animation = Some(later - Duration::from_millis(1));
+        app.handle_scheduled_tasks(later, false);
+        assert!(app.next_sidebar_animation.is_none());
+    }
+
+    #[test]
+    fn arm_sidebar_animation_is_a_no_op_when_nothing_animates() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+        set_root_pane_state(&mut app, AgentState::Idle, true);
+
+        app.arm_sidebar_animation(Instant::now());
+        assert!(app.next_sidebar_animation.is_none());
+
+        set_root_pane_state(&mut app, AgentState::Working, true);
+        app.arm_sidebar_animation(Instant::now());
+        assert!(app.next_sidebar_animation.is_some());
     }
 
     #[test]
