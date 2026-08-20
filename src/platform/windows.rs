@@ -2036,7 +2036,11 @@ fn parse_dropfiles(bytes: &[u8]) -> Option<Vec<String>> {
             }
         }
     }
-    if paths.is_empty() { None } else { Some(paths) }
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
 }
 
 fn read_registered_png_clipboard() -> Option<Vec<u8>> {
