@@ -1271,6 +1271,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
+                tag: None,
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
