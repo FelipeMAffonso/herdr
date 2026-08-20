@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
@@ -292,24 +292,44 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
     let Some(menu_rect) = app.context_menu_rect() else {
         return;
     };
-    let Some(inner) = render_panel_shell(frame, menu_rect, p.accent, p.panel_bg) else {
+    // The polish pass: a quiet border (the accent belongs to the selection, not
+    // the frame), and the selected row drawn the editor way - a subtle selection
+    // background under the whole row with a thin accent bar at its left edge,
+    // instead of a loud full-accent block.
+    let Some(inner) = render_panel_shell(frame, menu_rect, p.surface1, p.panel_bg) else {
         return;
     };
 
-    let items: Vec<ListItem> = menu
-        .items()
-        .iter()
-        .map(|item| ListItem::new(Line::from(*item)))
-        .collect();
-    let list = List::new(items)
-        .style(Style::default().fg(p.text))
-        .highlight_style(
-            Style::default()
-                .bg(p.accent)
-                .fg(panel_contrast_fg(p))
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(" ");
-    let mut state = ListState::default().with_selected(Some(menu.list.highlighted));
-    frame.render_stateful_widget(list, inner, &mut state);
+    for (idx, item) in menu.items().iter().enumerate() {
+        let y = inner.y + idx as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect::new(inner.x, y, inner.width, 1);
+        let selected = idx == menu.list.highlighted;
+        if selected {
+            let row_bg = Style::default().bg(p.selection_bg);
+            let buf = frame.buffer_mut();
+            for x in row.x..row.x + row.width {
+                buf[(x, y)].set_style(row_bg);
+            }
+            let line = Line::from(vec![
+                Span::styled("▎", Style::default().fg(p.accent).bg(p.selection_bg)),
+                Span::styled(
+                    format!("{item} "),
+                    Style::default()
+                        .fg(p.text)
+                        .bg(p.selection_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), row);
+        } else {
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{item} "), Style::default().fg(p.text)),
+            ]);
+            frame.render_widget(Paragraph::new(line), row);
+        }
+    }
 }
