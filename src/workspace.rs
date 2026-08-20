@@ -180,6 +180,8 @@ pub struct Workspace {
     pub id: String,
     /// User-provided override. If set, auto-derived identity stops updating.
     pub custom_name: Option<String>,
+    /// Free-form grouping label. Workspaces sharing a tag collapse together in the sidebar.
+    pub tag: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
     pub identity_cwd: PathBuf,
     /// CWD from which the cached automatic label and Git metadata were derived.
@@ -254,6 +256,7 @@ impl Workspace {
         Self {
             id,
             custom_name: label,
+            tag: None,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label,
@@ -453,6 +456,7 @@ impl Workspace {
             Self {
                 id,
                 custom_name: None,
+                tag: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
                 cached_auto_label,
@@ -1093,6 +1097,14 @@ impl Workspace {
         self.custom_name = Some(name);
     }
 
+    pub fn set_tag(&mut self, tag: Option<String>) {
+        self.tag = tag.filter(|value| !value.is_empty());
+    }
+
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
     #[cfg(test)]
     pub fn resolved_identity_cwd(&self) -> Option<PathBuf> {
         Some(self.identity_cwd.clone())
@@ -1291,6 +1303,7 @@ impl Workspace {
         Self {
             id: generate_workspace_id(),
             custom_name: Some(name.to_string()),
+            tag: None,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
             cached_auto_label: fallback_label_from_cwd(&identity_cwd),

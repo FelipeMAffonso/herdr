@@ -652,6 +652,9 @@ pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
     pub indented: bool,
+    /// When true, this card is a tag group header, not a workspace row. `ws_idx`
+    /// then points at the group's first workspace so its tag name is resolvable.
+    pub is_tag_header: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1196,6 +1199,7 @@ pub(crate) struct TabPressState {
 pub enum ContextMenuKind {
     Workspace {
         ws_idx: usize,
+        has_tag: bool,
     },
     GitWorkspace {
         ws_idx: usize,
@@ -1228,7 +1232,14 @@ pub struct ContextMenuState {
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&'static str> {
         match self.kind {
-            ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
+            ContextMenuKind::Workspace { has_tag, .. } => {
+                let mut items = vec!["Rename", "Tag..."];
+                if has_tag {
+                    items.push("Remove tag");
+                }
+                items.push("Close");
+                items
+            }
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
@@ -1412,6 +1423,8 @@ pub struct AppState {
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
     pub rename_pane_target: Option<PaneId>,
+    /// When set, the rename-workspace input edits this workspace's tag, not its name.
+    pub tag_edit_target: Option<usize>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
@@ -1796,6 +1809,7 @@ impl AppState {
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
+            tag_edit_target: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
@@ -2241,7 +2255,7 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
                 }
@@ -2623,5 +2637,41 @@ mod tests {
                 "Collapse"
             ]
         );
+    }
+
+    #[test]
+    fn untagged_workspace_context_menu_offers_tag_but_not_remove_tag() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        let items = menu.items();
+        assert!(items.contains(&"Tag..."));
+        assert!(!items.contains(&"Remove tag"));
+        assert!(items.contains(&"Rename"));
+        assert!(items.contains(&"Close"));
+    }
+
+    #[test]
+    fn tagged_workspace_context_menu_offers_remove_tag() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        let items = menu.items();
+        assert!(items.contains(&"Tag..."));
+        assert!(items.contains(&"Remove tag"));
     }
 }

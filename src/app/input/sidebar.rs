@@ -312,7 +312,8 @@ impl AppState {
         };
 
         cards.iter().find_map(|card| {
-            (row >= card.rect.y && row < card.rect.y + card.rect.height).then_some(card.ws_idx)
+            (!card.is_tag_header && row >= card.rect.y && row < card.rect.y + card.rect.height)
+                .then_some(card.ws_idx)
         })
     }
 

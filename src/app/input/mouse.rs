@@ -571,6 +571,26 @@ impl AppState {
                     } else {
                         self.view.workspace_card_areas.clone()
                     };
+                    if let Some(tag) = cards.iter().find_map(|card| {
+                        if !card.is_tag_header
+                            || mouse.row < card.rect.y
+                            || mouse.row >= card.rect.y + card.rect.height
+                        {
+                            return None;
+                        }
+                        self.workspaces
+                            .get(card.ws_idx)
+                            .and_then(|ws| ws.tag().map(str::to_string))
+                    }) {
+                        let key = crate::ui::tag_collapse_key(&tag);
+                        if self.collapsed_space_keys.contains(&key) {
+                            self.collapsed_space_keys.remove(&key);
+                        } else {
+                            self.collapsed_space_keys.insert(key);
+                        }
+                        self.mark_session_dirty();
+                        return None;
+                    }
                     if let Some(card) = cards.iter().find(|card| {
                         let chevron = crate::ui::workspace_group_chevron_rect(card);
                         mouse.row == chevron.y && mouse.column == chevron.x && chevron.width > 0
@@ -1076,7 +1096,13 @@ impl AppState {
                                     .is_some_and(|(_, collapsed)| *collapsed),
                             })
                         })
-                        .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
+                        .unwrap_or(ContextMenuKind::Workspace {
+                            ws_idx: idx,
+                            has_tag: self
+                                .workspaces
+                                .get(idx)
+                                .is_some_and(|ws| ws.tag().is_some()),
+                        });
                     self.context_menu = Some(ContextMenuState {
                         kind,
                         x: mouse.column,
@@ -3280,7 +3306,10 @@ mod tests {
     fn hovering_context_menu_updates_highlight() {
         let mut app = app_for_mouse_test();
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 0 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(0),
@@ -3574,7 +3603,10 @@ mod tests {
         app.state.mode = Mode::Terminal;
 
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(1),
@@ -3614,7 +3646,10 @@ mod tests {
         app.state.selected = 0;
         app.state.confirm_close = false;
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(1),

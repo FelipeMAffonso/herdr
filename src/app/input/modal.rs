@@ -375,9 +375,24 @@ pub(super) fn open_rename_workspace(
     state.pending_workspace_create_cwd = None;
     state.selected = ws_idx;
     state.rename_pane_target = None;
+    state.tag_edit_target = None;
     state.name_input =
         state.workspaces[ws_idx].display_name_from(&state.terminals, terminal_runtimes);
     state.name_input_replace_on_type = false;
+    state.mode = Mode::RenameWorkspace;
+}
+
+pub(super) fn open_tag_workspace(state: &mut AppState, ws_idx: usize) {
+    state.pending_workspace_create_cwd = None;
+    state.selected = ws_idx;
+    state.rename_pane_target = None;
+    state.tag_edit_target = Some(ws_idx);
+    state.name_input = state
+        .workspaces
+        .get(ws_idx)
+        .and_then(|ws| ws.tag().map(str::to_string))
+        .unwrap_or_default();
+    state.name_input_replace_on_type = state.name_input.is_empty();
     state.mode = Mode::RenameWorkspace;
 }
 
@@ -387,6 +402,7 @@ pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::Pa
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
     state.rename_pane_target = None;
+    state.tag_edit_target = None;
     state.name_input = suggested_name;
     state.name_input_replace_on_type = true;
     state.mode = Mode::RenameWorkspace;
@@ -802,13 +818,25 @@ pub(super) fn apply_context_menu_action(
             leave_modal(state);
         }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Rename"),
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
+            open_tag_workspace(state, ws_idx);
+        }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
+            if let Some(ws) = state.workspaces.get_mut(ws_idx) {
+                ws.set_tag(None);
+                state.mark_session_dirty();
+            }
+            leave_modal(state);
+        }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close" | "Close group"),
         ) => {
             state.selected = ws_idx;
@@ -1010,6 +1038,19 @@ impl App {
         } else {
             self.state.name_input.trim().to_string()
         };
+
+        if self.state.mode == Mode::RenameWorkspace {
+            if let Some(ws_idx) = self.state.tag_edit_target.take() {
+                let trimmed = self.state.name_input.trim();
+                let tag = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                    ws.set_tag(tag);
+                    self.state.mark_session_dirty();
+                }
+                cancel_rename_modal(&mut self.state);
+                return;
+            }
+        }
 
         match self.state.mode {
             Mode::RenameWorkspace => {
@@ -1232,12 +1273,22 @@ impl App {
                 leave_modal(&mut self.state);
             }
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Rename"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
+                open_tag_workspace(&mut self.state, ws_idx);
+            }
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
+                if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                    ws.set_tag(None);
+                    self.state.mark_session_dirty();
+                }
+                leave_modal(&mut self.state);
+            }
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Close" | "Close group"),
             ) => {
@@ -1451,6 +1502,7 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
     state.rename_pane_target = None;
+    state.tag_edit_target = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
     leave_modal(state);
@@ -2363,6 +2415,70 @@ mod tests {
                 .unwrap()
                 .right_click_passthrough
         );
+    }
+
+    fn workspace_tag_menu(ws_idx: usize, has_tag: bool) -> ContextMenuState {
+        ContextMenuState {
+            kind: ContextMenuKind::Workspace { ws_idx, has_tag },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        }
+    }
+
+    #[test]
+    fn context_menu_tag_action_sets_workspace_tag_from_input() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        let menu = workspace_tag_menu(0, false);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Tag...")
+            .expect("tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+        assert_eq!(app.state.tag_edit_target, Some(0));
+
+        app.state.name_input = "research".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.state.workspaces[0].tag(), Some("research"));
+        assert_eq!(app.state.tag_edit_target, None);
+    }
+
+    #[test]
+    fn context_menu_tag_action_with_blank_input_clears_tag() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Tag...")
+            .expect("tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "   ".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.state.workspaces[0].tag(), None);
+    }
+
+    #[test]
+    fn context_menu_remove_tag_clears_workspace_tag() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Remove tag")
+            .expect("remove tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert_eq!(app.state.workspaces[0].tag(), None);
     }
 
     #[test]

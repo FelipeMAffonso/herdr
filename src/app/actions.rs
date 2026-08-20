@@ -1190,13 +1190,7 @@ impl AppState {
             return;
         }
 
-        let entries = crate::ui::workspace_list_entries(self);
-        let Some(target_entry_idx) = entries.iter().position(|entry| {
-            matches!(
-                entry,
-                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx
-            )
-        }) else {
+        let Some(target_entry_idx) = crate::ui::workspace_display_row_index(self, idx) else {
             return;
         };
 
@@ -1205,8 +1199,13 @@ impl AppState {
             self.view.sidebar_rect,
             self.workspace_scroll,
         );
+        let card_shows_workspace = |cards: &[crate::app::state::WorkspaceCardArea]| -> bool {
+            cards
+                .iter()
+                .any(|card| !card.is_tag_header && card.ws_idx == idx)
+        };
         let mut cards = crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect);
-        if cards.iter().any(|card| card.ws_idx == idx) {
+        if card_shows_workspace(&cards) {
             return;
         }
 
@@ -1215,7 +1214,7 @@ impl AppState {
             return;
         }
 
-        while !cards.iter().any(|card| card.ws_idx == idx) {
+        while !card_shows_workspace(&cards) {
             let previous_scroll = self.workspace_scroll;
             self.workspace_scroll = self.workspace_scroll.saturating_add(1);
             if self.workspace_scroll == previous_scroll {
@@ -1298,18 +1297,18 @@ impl AppState {
 
     pub(crate) fn visible_workspace_order(&self) -> Vec<usize> {
         // Mobile always shows the worktree tree expanded, so its visible order
-        // must ignore collapse state to match what the switcher renders.
-        let entries = if self.view.layout == ViewLayout::Mobile {
+        // must ignore collapse state to match what the switcher renders. Desktop
+        // follows the drawn order, which also carries tag grouping.
+        let order = if self.view.layout == ViewLayout::Mobile {
             crate::ui::workspace_list_entries_expanded(self)
+                .into_iter()
+                .map(|entry| match entry {
+                    crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => ws_idx,
+                })
+                .collect::<Vec<_>>()
         } else {
-            crate::ui::workspace_list_entries(self)
+            crate::ui::workspace_display_order(self)
         };
-        let order = entries
-            .into_iter()
-            .map(|entry| match entry {
-                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => ws_idx,
-            })
-            .collect::<Vec<_>>();
         if order.is_empty() {
             (0..self.workspaces.len()).collect()
         } else {

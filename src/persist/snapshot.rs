@@ -52,6 +52,8 @@ pub struct WorkspaceSnapshot {
     pub id: Option<String>,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -156,6 +158,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         Self {
             id: None,
             custom_name: snap.custom_name,
+            tag: None,
             identity_cwd,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
@@ -287,6 +290,7 @@ fn capture_workspace(
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
+        tag: ws.tag.clone(),
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
@@ -666,6 +670,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
+                tag: Some("research".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
@@ -704,6 +709,7 @@ mod tests {
             restored.workspaces[0].custom_name.as_deref(),
             Some("pi-mono")
         );
+        assert_eq!(restored.workspaces[0].tag.as_deref(), Some("research"));
         assert_eq!(restored.workspaces[0].tabs.len(), 1);
         assert_eq!(restored.workspaces[0].tabs[0].panes.len(), 2);
         assert_eq!(
@@ -849,6 +855,43 @@ mod tests {
         assert_eq!(workspace.active_tab, second_tab);
         assert_eq!(workspace.tabs[0].custom_name.as_deref(), Some("main"));
         assert_eq!(workspace.tabs[1].custom_name.as_deref(), Some("logs"));
+    }
+
+    #[test]
+    fn capture_and_parse_round_trip_workspace_tag() {
+        let mut state = state_with_workspaces(&["one"]);
+        state.workspaces[0].set_tag(Some("teaching".into()));
+
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(restored.workspaces[0].tag.as_deref(), Some("teaching"));
+    }
+
+    #[test]
+    fn old_snapshot_without_tag_defaults_to_none() {
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [{
+                "id": "wtest",
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": { "Pane": 0 },
+                    "panes": { "0": { "cwd": "/tmp" } },
+                    "zoomed": false,
+                    "focused": 0,
+                    "root_pane": 0
+                }],
+                "active_tab": 0
+            }],
+            "active": 0,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(restored.workspaces[0].tag, None);
     }
 
     #[test]
