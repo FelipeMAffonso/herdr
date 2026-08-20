@@ -376,6 +376,7 @@ pub(super) fn open_rename_workspace(
     state.selected = ws_idx;
     state.rename_pane_target = None;
     state.tag_edit_target = None;
+    state.tag_rename_from = None;
     state.name_input =
         state.workspaces[ws_idx].display_name_from(&state.terminals, terminal_runtimes);
     state.name_input_replace_on_type = false;
@@ -387,12 +388,33 @@ pub(super) fn open_tag_workspace(state: &mut AppState, ws_idx: usize) {
     state.selected = ws_idx;
     state.rename_pane_target = None;
     state.tag_edit_target = Some(ws_idx);
+    state.tag_rename_from = None;
     state.name_input = state
         .workspaces
         .get(ws_idx)
         .and_then(|ws| ws.tag().map(str::to_string))
         .unwrap_or_default();
     state.name_input_replace_on_type = state.name_input.is_empty();
+    state.mode = Mode::RenameWorkspace;
+}
+
+/// Open the rename overlay to rename a tag across every workspace that carries it.
+/// Reuses `Mode::RenameWorkspace`; `tag_rename_from` records the tag being renamed.
+pub(super) fn open_rename_tag(state: &mut AppState, ws_idx: usize) {
+    let Some(current) = state
+        .workspaces
+        .get(ws_idx)
+        .and_then(|ws| ws.tag().map(str::to_string))
+    else {
+        return;
+    };
+    state.pending_workspace_create_cwd = None;
+    state.selected = ws_idx;
+    state.rename_pane_target = None;
+    state.tag_edit_target = None;
+    state.tag_rename_from = Some(current.clone());
+    state.name_input = current;
+    state.name_input_replace_on_type = false;
     state.mode = Mode::RenameWorkspace;
 }
 
@@ -403,6 +425,7 @@ pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::Pa
     state.pending_workspace_create_cwd = Some(cwd);
     state.rename_pane_target = None;
     state.tag_edit_target = None;
+    state.tag_rename_from = None;
     state.name_input = suggested_name;
     state.name_input_replace_on_type = true;
     state.mode = Mode::RenameWorkspace;
@@ -827,6 +850,9 @@ pub(super) fn apply_context_menu_action(
         (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
             open_tag_workspace(state, ws_idx);
         }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Rename tag...")) => {
+            open_rename_tag(state, ws_idx);
+        }
         (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
             if let Some(ws) = state.workspaces.get_mut(ws_idx) {
                 ws.set_tag(None);
@@ -1040,6 +1066,28 @@ impl App {
         };
 
         if self.state.mode == Mode::RenameWorkspace {
+            if let Some(old_tag) = self.state.tag_rename_from.take() {
+                let new_tag = self.state.name_input.trim().to_string();
+                // A blank rename is a plain cancel: never mass-untag on an empty input.
+                if !new_tag.is_empty() {
+                    for ws in &mut self.state.workspaces {
+                        if ws.tag() == Some(old_tag.as_str()) {
+                            ws.set_tag(Some(new_tag.clone()));
+                        }
+                    }
+                    // Carry the collapse state across the rename so a collapsed
+                    // group stays collapsed under its new key.
+                    let old_key = crate::ui::tag_collapse_key(&old_tag);
+                    if self.state.collapsed_space_keys.remove(&old_key) {
+                        self.state
+                            .collapsed_space_keys
+                            .insert(crate::ui::tag_collapse_key(&new_tag));
+                    }
+                    self.state.mark_session_dirty();
+                }
+                cancel_rename_modal(&mut self.state);
+                return;
+            }
             if let Some(ws_idx) = self.state.tag_edit_target.take() {
                 let trimmed = self.state.name_input.trim();
                 let tag = (!trimmed.is_empty()).then(|| trimmed.to_string());
@@ -1280,6 +1328,9 @@ impl App {
             (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
                 open_tag_workspace(&mut self.state, ws_idx);
             }
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Rename tag...")) => {
+                open_rename_tag(&mut self.state, ws_idx);
+            }
             (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
                 if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
                     ws.set_tag(None);
@@ -1503,6 +1554,7 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.pending_workspace_create_cwd = None;
     state.rename_pane_target = None;
     state.tag_edit_target = None;
+    state.tag_rename_from = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
     leave_modal(state);
@@ -2479,6 +2531,84 @@ mod tests {
         app.apply_context_menu_action_via_api(menu, idx);
 
         assert_eq!(app.state.workspaces[0].tag(), None);
+    }
+
+    #[test]
+    fn context_menu_rename_tag_applies_to_every_carrier() {
+        let mut app = app_with_test_workspaces(&["a", "b", "c"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("teaching".into()));
+        app.state.workspaces[2].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+        assert_eq!(app.state.tag_rename_from.as_deref(), Some("research"));
+
+        app.state.name_input = "papers".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Every "research" carrier is renamed; the unrelated tag is untouched.
+        assert_eq!(app.state.workspaces[0].tag(), Some("papers"));
+        assert_eq!(app.state.workspaces[1].tag(), Some("teaching"));
+        assert_eq!(app.state.workspaces[2].tag(), Some("papers"));
+        assert_eq!(app.state.tag_rename_from, None);
+    }
+
+    #[test]
+    fn context_menu_rename_tag_migrates_collapse_key() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("research".into()));
+        app.state
+            .collapsed_space_keys
+            .insert(crate::ui::tag_collapse_key("research"));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "papers".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app
+            .state
+            .collapsed_space_keys
+            .contains(&crate::ui::tag_collapse_key("research")));
+        assert!(app
+            .state
+            .collapsed_space_keys
+            .contains(&crate::ui::tag_collapse_key("papers")));
+    }
+
+    #[test]
+    fn context_menu_rename_tag_with_blank_input_is_a_no_op() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "   ".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Blank input cancels: no mass-untag, both carriers keep the original tag.
+        assert_eq!(app.state.workspaces[0].tag(), Some("research"));
+        assert_eq!(app.state.workspaces[1].tag(), Some("research"));
+        assert_eq!(app.state.tag_rename_from, None);
     }
 
     #[test]

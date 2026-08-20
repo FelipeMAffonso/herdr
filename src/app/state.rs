@@ -1235,6 +1235,7 @@ impl ContextMenuState {
             ContextMenuKind::Workspace { has_tag, .. } => {
                 let mut items = vec!["Rename", "Tag..."];
                 if has_tag {
+                    items.push("Rename tag...");
                     items.push("Remove tag");
                 }
                 items.push("Close");
@@ -1425,6 +1426,9 @@ pub struct AppState {
     pub rename_pane_target: Option<PaneId>,
     /// When set, the rename-workspace input edits this workspace's tag, not its name.
     pub tag_edit_target: Option<usize>,
+    /// When set, the rename-workspace input renames this tag across every workspace
+    /// that carries it, rather than editing a single workspace's tag.
+    pub tag_rename_from: Option<String>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
@@ -1810,6 +1814,7 @@ impl AppState {
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
             tag_edit_target: None,
+            tag_rename_from: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
@@ -2673,5 +2678,42 @@ mod tests {
         let items = menu.items();
         assert!(items.contains(&"Tag..."));
         assert!(items.contains(&"Remove tag"));
+    }
+
+    #[test]
+    fn tagged_workspace_context_menu_places_rename_tag_between_tag_and_remove() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        let items = menu.items();
+        let tag = items.iter().position(|item| *item == "Tag...").unwrap();
+        let rename = items
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .unwrap();
+        let remove = items.iter().position(|item| *item == "Remove tag").unwrap();
+        assert!(tag < rename && rename < remove);
+    }
+
+    #[test]
+    fn untagged_workspace_context_menu_hides_rename_tag() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert!(!menu.items().contains(&"Rename tag..."));
     }
 }

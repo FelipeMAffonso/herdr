@@ -311,6 +311,45 @@ pub(crate) fn tag_collapse_key(tag: &str) -> String {
     format!("tag:{tag}")
 }
 
+/// Rolled-up attention level for a group of workspaces, most-urgent first. Used
+/// to color the leading edge of a tag group header from its members' states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NeedLevel {
+    /// A member is blocked and needs a human.
+    Blocked,
+    /// A member finished and has not been seen yet (idle + unseen).
+    NeedsYou,
+    /// A member is actively working.
+    Working,
+    /// A member is idle and already seen — nothing pending, but present.
+    Idle,
+}
+
+fn need_level_priority(need: NeedLevel) -> u8 {
+    match need {
+        NeedLevel::Blocked => 3,
+        NeedLevel::NeedsYou => 2,
+        NeedLevel::Working => 1,
+        NeedLevel::Idle => 0,
+    }
+}
+
+/// Reduce each member's `(state, seen)` to the strongest attention level across
+/// the group, ordered Blocked > NeedsYou > Working > Idle. An empty slice, or a
+/// group whose members are all Unknown, yields `None` (no edge to draw).
+pub(crate) fn need_rollup(states: &[(AgentState, bool)]) -> Option<NeedLevel> {
+    states
+        .iter()
+        .filter_map(|(state, seen)| match (state, seen) {
+            (AgentState::Blocked, _) => Some(NeedLevel::Blocked),
+            (AgentState::Idle, false) => Some(NeedLevel::NeedsYou),
+            (AgentState::Working, _) => Some(NeedLevel::Working),
+            (AgentState::Idle, true) => Some(NeedLevel::Idle),
+            (AgentState::Unknown, _) => None,
+        })
+        .max_by_key(|need| need_level_priority(*need))
+}
+
 /// One ordered tag group: the tag name and the top-level entry indices that
 /// belong to it, in their original list order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1452,6 +1491,31 @@ fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) 
     style
 }
 
+/// Stable color for a tag, hashed from its bytes onto a small palette-derived
+/// set. `p.red` is deliberately excluded: red is reserved for broken/blocked
+/// state, so no tag ever borrows it. The same tag always maps to the same color.
+pub(crate) fn tag_color(tag: &str, p: &Palette) -> Color {
+    let palette = [p.accent, p.teal, p.green, p.yellow];
+    let hash = tag.bytes().fold(0u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u32)
+    });
+    palette[(hash as usize) % palette.len()]
+}
+
+/// Leading attention edge for a tag group header: the strongest state across the
+/// group's members, colored as the sidebar colors that state. `Working` shows no
+/// colored edge (a dim space), matching the boards' quiet treatment of working.
+fn tag_group_edge(need: Option<NeedLevel>, p: &Palette) -> Span<'static> {
+    match need {
+        Some(NeedLevel::Blocked) => Span::styled("▎", Style::default().fg(p.red)),
+        Some(NeedLevel::NeedsYou) => Span::styled("▎", Style::default().fg(p.green)),
+        Some(NeedLevel::Idle) => Span::styled("▎", Style::default().fg(p.yellow)),
+        // Working or empty: no colored edge, just a placeholder cell so the
+        // chevron column stays aligned across headers.
+        _ => Span::styled(" ", Style::default().fg(p.overlay0)),
+    }
+}
+
 fn render_tag_group_header(
     app: &AppState,
     frame: &mut Frame,
@@ -1474,13 +1538,23 @@ fn render_tag_group_header(
                 if app.workspaces.get(*ws_idx).and_then(|ws| ws.tag()) == Some(tag))
         })
         .count();
+    // Rolled-up attention across every workspace carrying this tag drives the edge.
+    let member_states: Vec<(AgentState, bool)> = app
+        .workspaces
+        .iter()
+        .filter(|ws| ws.tag() == Some(tag))
+        .map(|ws| ws.aggregate_state(&app.terminals))
+        .collect();
+    let need = need_rollup(&member_states);
+    let color = tag_color(tag, p);
     let collapsed = app.collapsed_space_keys.contains(&tag_collapse_key(tag));
     let chevron = if collapsed { "▸" } else { "▾" };
     let spans = vec![
-        Span::styled(format!(" {chevron} "), Style::default().fg(p.accent)),
+        tag_group_edge(need, p),
+        Span::styled(format!("{chevron} "), Style::default().fg(color)),
         Span::styled(
             tag.to_string(),
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  {count}"), Style::default().fg(p.overlay0)),
     ];
@@ -3596,5 +3670,71 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             ]
         );
         assert_eq!(workspace_display_order(&app), vec![2]);
+    }
+
+    #[test]
+    fn tag_color_is_stable_for_the_same_tag() {
+        let p = Palette::catppuccin();
+        assert_eq!(tag_color("research", &p), tag_color("research", &p));
+        assert_eq!(tag_color("teaching", &p), tag_color("teaching", &p));
+    }
+
+    #[test]
+    fn tag_color_differs_for_two_known_different_tags() {
+        let p = Palette::catppuccin();
+        // "research" hashes to bucket 3 (yellow), "teaching" to bucket 1 (teal),
+        // so the two land on different palette colors.
+        assert_ne!(tag_color("research", &p), tag_color("teaching", &p));
+    }
+
+    #[test]
+    fn tag_color_never_returns_red() {
+        let p = Palette::catppuccin();
+        for tag in [
+            "research", "teaching", "prepara", "a", "b", "c", "d", "e", "zzz", "ops", "docs",
+            "video",
+        ] {
+            assert_ne!(tag_color(tag, &p), p.red);
+        }
+    }
+
+    #[test]
+    fn need_rollup_empty_is_none() {
+        assert_eq!(need_rollup(&[]), None);
+    }
+
+    #[test]
+    fn need_rollup_orders_blocked_over_needs_you_over_working_over_idle() {
+        // Blocked wins over everything.
+        assert_eq!(
+            need_rollup(&[
+                (AgentState::Idle, true),
+                (AgentState::Working, true),
+                (AgentState::Idle, false),
+                (AgentState::Blocked, true),
+            ]),
+            Some(NeedLevel::Blocked)
+        );
+        // NeedsYou (idle + unseen) wins over working and idle-seen.
+        assert_eq!(
+            need_rollup(&[
+                (AgentState::Idle, true),
+                (AgentState::Working, true),
+                (AgentState::Idle, false),
+            ]),
+            Some(NeedLevel::NeedsYou)
+        );
+        // Working wins over idle-seen.
+        assert_eq!(
+            need_rollup(&[(AgentState::Idle, true), (AgentState::Working, true)]),
+            Some(NeedLevel::Working)
+        );
+        // Idle-seen is the floor.
+        assert_eq!(
+            need_rollup(&[(AgentState::Idle, true)]),
+            Some(NeedLevel::Idle)
+        );
+        // Unknown-only rolls up to nothing.
+        assert_eq!(need_rollup(&[(AgentState::Unknown, true)]), None);
     }
 }
