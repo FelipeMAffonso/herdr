@@ -843,9 +843,14 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     // Reattach and ensure client-side state reflects the persisted working status.
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
     client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
+    // Working renders as an animated braille spinner now, so any frame glyph in
+    // the working color proves the persisted status reached the client.
+    const WORKING_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_colored_symbol(frame, "●", (249, 226, 175))
+            WORKING_SPINNER_FRAMES
+                .iter()
+                .any(|glyph| frame_contains_colored_symbol(frame, glyph, (249, 226, 175)))
         })
         .expect("frame decoding should succeed");
     assert!(
