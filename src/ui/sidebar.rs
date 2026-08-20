@@ -35,6 +35,7 @@ pub(crate) struct AgentPanelEntry {
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
+    pub last_agent_state_change_at: Option<std::time::Instant>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
 }
@@ -175,6 +176,7 @@ fn collect_agent_panel_entries_with_runtimes(
                         state: detail.state,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
+                        last_agent_state_change_at: detail.last_agent_state_change_at,
                         state_labels: detail.state_labels,
                         tokens: detail.tokens,
                     }
@@ -1023,6 +1025,7 @@ fn resolved_token_spans(
         .iter()
         .map(|token| match &token.kind {
             ResolvedTokenKind::StateIcon => display_width(state_icon.0),
+            ResolvedTokenKind::NeedEdge { .. } => 1,
             ResolvedTokenKind::GitStatus { ahead, behind } => {
                 usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
@@ -1041,6 +1044,7 @@ fn resolved_token_spans(
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::TerminalTitle(text)
             | ResolvedTokenKind::Branch(text)
+            | ResolvedTokenKind::Waiting { text, .. }
             | ResolvedTokenKind::Custom(text) => display_width(text),
             _ => 0,
         })
@@ -1173,6 +1177,33 @@ fn resolved_token_spans(
                         apply_token_style(Style::default().fg(p.red), token.style),
                     ));
                 }
+            }
+            ResolvedTokenKind::NeedEdge { state, seen } => {
+                let (symbol, color) = match (state, seen) {
+                    (AgentState::Blocked, _) => ("▎", Some(p.red)),
+                    (AgentState::Idle, false) => ("▎", Some(p.green)),
+                    (AgentState::Idle, true) => ("▎", Some(p.yellow)),
+                    (AgentState::Working | AgentState::Unknown, _) => (" ", None),
+                };
+                let style = color.map_or_else(Style::default, |color| Style::default().fg(color));
+                spans.push(Span::styled(
+                    symbol.to_string(),
+                    apply_token_style(style, token.style),
+                ));
+            }
+            ResolvedTokenKind::Waiting { text, state } => {
+                let color = if *state == AgentState::Blocked {
+                    p.red
+                } else {
+                    p.green
+                };
+                spans.push(Span::styled(
+                    truncate_end(text, budgets[index]),
+                    apply_token_style(
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        token.style,
+                    ),
+                ));
             }
             ResolvedTokenKind::TerminalTitle(text) | ResolvedTokenKind::Custom(text) => {
                 spans.push(Span::styled(

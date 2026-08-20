@@ -110,6 +110,13 @@ pub enum AgentSidebarToken {
     Agent,
     TerminalTitle,
     TerminalTitleStripped,
+    /// A thin colored bar answering "does this agent need me": green when the
+    /// agent finished and waits unseen, red when blocked, yellow when idle,
+    /// blank while working.
+    NeedEdge,
+    /// "waiting 12m" - how long the agent has needed attention. Empty (row
+    /// elides) unless the agent is blocked or finished-and-unseen.
+    Waiting,
     Custom(String),
     Styled {
         token: Box<AgentSidebarToken>,
@@ -240,6 +247,8 @@ fn agent_token_name(token: &AgentSidebarToken) -> String {
         AgentSidebarToken::Agent => "agent".into(),
         AgentSidebarToken::TerminalTitle => "terminal_title".into(),
         AgentSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
+        AgentSidebarToken::NeedEdge => "need_edge".into(),
+        AgentSidebarToken::Waiting => "waiting".into(),
         AgentSidebarToken::Custom(name) => format!("${name}"),
         AgentSidebarToken::Styled { token, .. } => agent_token_name(token),
     }
@@ -294,6 +303,8 @@ impl<'de> Deserialize<'de> for AgentSidebarToken {
                 ("agent", Self::Agent),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
+                ("need_edge", Self::NeedEdge),
+                ("waiting", Self::Waiting),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -511,6 +522,29 @@ row_gap = 3
             vec![SpaceSidebarToken::Custom("jj_status".into())]
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
+    }
+
+    #[test]
+    fn parses_need_edge_and_waiting_tokens() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents]
+rows = [["need_edge", "state_icon", "workspace"], ["need_edge", "waiting"]]
+"#,
+        )
+        .expect("need edge config");
+
+        assert_eq!(
+            config.ui.sidebar.agents.rows,
+            vec![
+                vec![
+                    AgentSidebarToken::NeedEdge,
+                    AgentSidebarToken::StateIcon,
+                    AgentSidebarToken::Workspace,
+                ],
+                vec![AgentSidebarToken::NeedEdge, AgentSidebarToken::Waiting],
+            ]
+        );
     }
 
     #[test]

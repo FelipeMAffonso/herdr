@@ -20,8 +20,39 @@ pub(super) enum ResolvedTokenKind {
     Agent(String),
     TerminalTitle(String),
     Branch(String),
-    GitStatus { ahead: usize, behind: usize },
+    GitStatus {
+        ahead: usize,
+        behind: usize,
+    },
+    NeedEdge {
+        state: crate::detect::AgentState,
+        seen: bool,
+    },
+    Waiting {
+        text: String,
+        state: crate::detect::AgentState,
+    },
     Custom(String),
+}
+
+/// True when the agent is sitting on Felipe's time: finished and not yet
+/// looked at, or blocked on a question.
+pub(super) fn needs_attention(state: crate::detect::AgentState, seen: bool) -> bool {
+    matches!(
+        (state, seen),
+        (crate::detect::AgentState::Blocked, _) | (crate::detect::AgentState::Idle, false)
+    )
+}
+
+fn waiting_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("waiting {secs}s")
+    } else if secs < 3600 {
+        format!("waiting {}m", secs / 60)
+    } else {
+        format!("waiting {}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 impl ResolvedToken {
@@ -73,6 +104,17 @@ pub(super) fn agent_rows(
                             .terminal_title_stripped
                             .clone()
                             .map(ResolvedTokenKind::TerminalTitle),
+                        AgentSidebarToken::NeedEdge => Some(ResolvedTokenKind::NeedEdge {
+                            state: entry.state,
+                            seen: entry.seen,
+                        }),
+                        AgentSidebarToken::Waiting => needs_attention(entry.state, entry.seen)
+                            .then(|| entry.last_agent_state_change_at)
+                            .flatten()
+                            .map(|at| ResolvedTokenKind::Waiting {
+                                text: waiting_text(at.elapsed()),
+                                state: entry.state,
+                            }),
                         AgentSidebarToken::Custom(name) => entry
                             .tokens
                             .get(name)
@@ -142,7 +184,10 @@ pub(super) fn space_rows(
 }
 
 pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
-    if matches!(previous.kind, ResolvedTokenKind::StateIcon)
+    if matches!(previous.kind, ResolvedTokenKind::NeedEdge { .. }) {
+        // The edge is a gutter; content hugs it.
+        ""
+    } else if matches!(previous.kind, ResolvedTokenKind::StateIcon)
         || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
     {
         " "
@@ -173,6 +218,7 @@ mod tests {
             state: AgentState::Working,
             seen: true,
             last_agent_state_change_seq: None,
+            last_agent_state_change_at: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
         }
@@ -283,6 +329,69 @@ mod tests {
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Workspace(
                 "repo".into()
             ))]]
+        );
+    }
+
+    #[test]
+    fn need_edge_and_waiting_resolve_from_agent_need_state() {
+        let mut entry = entry();
+        entry.state = AgentState::Idle;
+        entry.seen = false;
+        entry.last_agent_state_change_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(725));
+        let config = AgentsSidebarConfig {
+            rows: vec![
+                vec![AgentSidebarToken::NeedEdge, AgentSidebarToken::Workspace],
+                vec![AgentSidebarToken::NeedEdge, AgentSidebarToken::Waiting],
+            ],
+            ..Default::default()
+        };
+
+        let rows = agent_rows(&config, &entry, "done");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0][0],
+            ResolvedToken::unstyled(ResolvedTokenKind::NeedEdge {
+                state: AgentState::Idle,
+                seen: false,
+            })
+        );
+        assert_eq!(
+            rows[1][1],
+            ResolvedToken::unstyled(ResolvedTokenKind::Waiting {
+                text: "waiting 12m".into(),
+                state: AgentState::Idle,
+            })
+        );
+
+        // A working agent keeps its edge slot (blank in the renderer) but the
+        // waiting row elides entirely.
+        entry.state = AgentState::Working;
+        entry.seen = true;
+        let rows = agent_rows(&config, &entry, "working");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0],
+            ResolvedToken::unstyled(ResolvedTokenKind::NeedEdge {
+                state: AgentState::Working,
+                seen: true,
+            })
+        );
+    }
+
+    #[test]
+    fn waiting_text_scales_by_duration() {
+        assert_eq!(
+            waiting_text(std::time::Duration::from_secs(45)),
+            "waiting 45s"
+        );
+        assert_eq!(
+            waiting_text(std::time::Duration::from_secs(725)),
+            "waiting 12m"
+        );
+        assert_eq!(
+            waiting_text(std::time::Duration::from_secs(3600 + 720)),
+            "waiting 1h 12m"
         );
     }
 
