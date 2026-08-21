@@ -84,7 +84,7 @@ fn descriptor<'a>(
 /// prefix, what does the next key do?".
 fn prefix_action_groups(
     kb: &crate::config::Keybinds,
-) -> Vec<(&'static str, Vec<ActionDescriptor>)> {
+) -> Vec<(&'static str, Vec<ActionDescriptor<'_>>)> {
     vec![
         (
             "global",
@@ -140,12 +140,39 @@ fn prefix_action_groups(
                 descriptor(&kb.focus_pane_down, "focus pane down"),
                 descriptor(&kb.focus_pane_up, "focus pane up"),
                 descriptor(&kb.focus_pane_right, "focus pane right"),
+                descriptor(&kb.swap_pane_left, "swap pane left"),
+                descriptor(&kb.swap_pane_down, "swap pane down"),
+                descriptor(&kb.swap_pane_up, "swap pane up"),
+                descriptor(&kb.swap_pane_right, "swap pane right"),
                 descriptor(&kb.cycle_pane_next, "cycle pane next"),
                 descriptor(&kb.cycle_pane_previous, "cycle pane previous"),
                 descriptor(&kb.last_pane, "last pane"),
             ],
         ),
     ]
+}
+
+/// The bare prefix-continuation chord for an indexed 1..9 binding set (for
+/// example `switch_tab = "prefix+1..9"` compacts to `1..9`). `None` when no
+/// prefix-triggered indexed binding exists.
+fn indexed_prefix_rhs(bindings: &[crate::config::IndexedKeybind]) -> Option<String> {
+    let stripped: Vec<crate::config::IndexedKeybind> = bindings
+        .iter()
+        .filter(|binding| binding.trigger.is_prefix())
+        .map(|binding| crate::config::IndexedKeybind {
+            trigger: binding.trigger,
+            label: binding
+                .label
+                .strip_prefix("prefix+")
+                .unwrap_or(&binding.label)
+                .to_string(),
+        })
+        .collect();
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(indexed_label(&stripped))
+    }
 }
 
 /// The which-key entries shown while the prefix chord is held: every binding
@@ -156,19 +183,8 @@ pub(crate) fn prefix_which_key_groups(app: &AppState) -> Vec<HelpGroup> {
     let kb = &app.keybinds;
     let mut groups: Vec<HelpGroup> = Vec::new();
 
-    for (name, actions) in prefix_action_groups(kb) {
-        let entries: Vec<HelpEntry> = actions
-            .into_iter()
-            .filter_map(|action| {
-                let chord = action.bindings.prefix_rhs_label()?;
-                Some((chord, Cow::Borrowed(action.description)))
-            })
-            .collect();
-        if !entries.is_empty() {
-            groups.push((name, entries));
-        }
-    }
-
+    // The user's own commands lead: those are the bindings memory fails on, and
+    // when the terminal is too small to show everything they must survive the cut.
     let custom: Vec<HelpEntry> = kb
         .custom_commands
         .iter()
@@ -184,6 +200,30 @@ pub(crate) fn prefix_which_key_groups(app: &AppState) -> Vec<HelpGroup> {
         .collect();
     if !custom.is_empty() {
         groups.push(("custom", custom));
+    }
+
+    for (name, actions) in prefix_action_groups(kb) {
+        let mut entries: Vec<HelpEntry> = actions
+            .into_iter()
+            .filter_map(|action| {
+                let chord = action.bindings.prefix_rhs_label()?;
+                Some((chord, Cow::Borrowed(action.description)))
+            })
+            .collect();
+        if name == "workspaces / tabs" {
+            if let Some(chord) = indexed_prefix_rhs(&kb.switch_workspace) {
+                entries.push((chord, Cow::Borrowed("switch workspace 1-9")));
+            }
+            if let Some(chord) = indexed_prefix_rhs(&kb.focus_agent) {
+                entries.push((chord, Cow::Borrowed("focus agent 1-9")));
+            }
+            if let Some(chord) = indexed_prefix_rhs(&kb.switch_tab) {
+                entries.push((chord, Cow::Borrowed("switch tab 1-9")));
+            }
+        }
+        if !entries.is_empty() {
+            groups.push((name, entries));
+        }
     }
 
     groups

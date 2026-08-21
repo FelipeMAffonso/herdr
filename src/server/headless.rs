@@ -4729,6 +4729,10 @@ impl HeadlessServer {
             changed = true;
         }
 
+        if self.app.expire_prefix_which_key(now) {
+            changed = true;
+        }
+
         if self
             .app
             .config_diagnostic_deadline

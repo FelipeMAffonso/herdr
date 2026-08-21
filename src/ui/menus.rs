@@ -33,8 +33,10 @@ pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rec
     // Once the prefix has been held past the which-key delay, or an unbound key was
     // pressed, expand into the full which-key popup listing every continuation. The
     // slim bottom bar stays the instant, low-noise hint for the muscle-memory case.
+    // The popup centers on the terminal surface, not the mode-bar row: with a
+    // bottom tab bar `area` is that single row and could never hold a card.
     if app.prefix_which_key_expanded {
-        render_prefix_which_key_popup(app, frame, area);
+        render_prefix_which_key_popup(app, frame, app.view.terminal_area, area);
         return;
     }
 
@@ -71,9 +73,12 @@ pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rec
 
 /// The which-key card: after the prefix chord, a rounded panel listing every
 /// bound continuation (built-ins plus `[[keys.command]]` customs with their
-/// descriptions) so nothing rests on memory. Laid out in as many columns as fit,
-/// grouped, styled like the other polished menus.
-fn render_prefix_which_key_popup(app: &AppState, frame: &mut Frame, area: Rect) {
+/// descriptions) so nothing rests on memory. Laid out in as many columns as fit
+/// so the whole list is visible on ordinary terminals; when even that cannot fit,
+/// the last visible row becomes a "+N more" count rather than a silent cut.
+/// `area` hosts the centered card; `bar_area` hosts the slim fallback bar when
+/// the card cannot fit at all.
+fn render_prefix_which_key_popup(app: &AppState, frame: &mut Frame, area: Rect, bar_area: Rect) {
     let groups = prefix_which_key_groups(app);
 
     // Flatten into rendered lines: a bold heading per group, then one row per
@@ -85,6 +90,7 @@ fn render_prefix_which_key_popup(app: &AppState, frame: &mut Frame, area: Rect) 
         .fg(app.palette.mauve)
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default().fg(app.palette.text);
+    let dim_style = Style::default().fg(app.palette.overlay0);
 
     let chord_width = groups
         .iter()
@@ -106,36 +112,59 @@ fn render_prefix_which_key_popup(app: &AppState, frame: &mut Frame, area: Rect) 
             ]));
         }
     }
+    if lines.is_empty() {
+        render_prefix_hint_bar(app, frame, bar_area);
+        return;
+    }
 
-    // Size the card to its content, capped to the available area. The border and a
-    // one-row title cost two rows and two columns of padding.
-    let content_rows = lines.len() as u16;
+    // Column layout. A column is as wide as the widest line plus a two-cell
+    // gutter; the popup carries a border (2 rows/cols) and a one-row title.
+    let title = " prefix ";
+    let title_hint = "next key";
+    let total = lines.len();
     let widest = lines
         .iter()
-        .map(|line| line.width() as u16)
+        .map(ratatui::text::Line::width)
         .max()
-        .unwrap_or(0);
-    let title = " prefix ";
-    let desired_w = widest.max(title.len() as u16).saturating_add(4);
-    let desired_h = content_rows.saturating_add(4);
-    let popup_w = desired_w.min(area.width);
-    let popup_h = desired_h.min(area.height);
+        .unwrap_or(0)
+        .max(title.len() + title_hint.len())
+        .max(1);
+    let col_w = widest + 2;
 
+    let avail_w = area.width.saturating_sub(4) as usize;
+    let avail_h = area.height.saturating_sub(2) as usize;
+    let max_body_rows = avail_h.saturating_sub(3);
+    if max_body_rows == 0 || avail_w < 4 {
+        render_prefix_hint_bar(app, frame, bar_area);
+        return;
+    }
+    let max_cols = (avail_w / col_w).max(1);
+    let cols = total.div_ceil(max_body_rows).min(max_cols);
+    let body_rows = total.div_ceil(cols).min(max_body_rows);
+    let shown = (cols * body_rows).min(total);
+    if shown < total {
+        // Not everything fits even in columns: the last visible row says how much
+        // is hidden instead of cutting the list silently.
+        let hidden = total - shown + 1;
+        lines[shown - 1] = Line::from(Span::styled(format!(" +{hidden} more"), dim_style));
+    }
+
+    let popup_w = ((cols * col_w) as u16).min(area.width);
+    let popup_h = ((body_rows + 3) as u16).min(area.height);
     let Some(popup) = centered_popup_rect(area, popup_w, popup_h) else {
         // Too small for the card: fall back to the slim bar so the mode is never invisible.
-        render_prefix_hint_bar(app, frame, area);
+        render_prefix_hint_bar(app, frame, bar_area);
         return;
     };
     let Some(inner) = render_panel_shell(frame, popup, app.palette.surface1, app.palette.panel_bg)
     else {
-        render_prefix_hint_bar(app, frame, area);
+        render_prefix_hint_bar(app, frame, bar_area);
         return;
     };
     if inner.height < 2 || inner.width < 2 {
         return;
     }
 
-    // Title row, then a blank spacer, then the binding lines.
     let title_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -145,18 +174,31 @@ fn render_prefix_which_key_popup(app: &AppState, frame: &mut Frame, area: Rect) 
                     .fg(app.palette.text)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("next key", Style::default().fg(app.palette.overlay0)),
+            Span::styled(title_hint, dim_style),
         ])),
         title_area,
     );
 
     let body_y = inner.y + 1;
-    let body_height = inner.height.saturating_sub(1);
+    let body_height = (inner.height.saturating_sub(1) as usize).min(body_rows);
     if body_height == 0 {
         return;
     }
-    let body_area = Rect::new(inner.x, body_y, inner.width, body_height);
-    frame.render_widget(Paragraph::new(lines), body_area);
+    lines.truncate(shown);
+    for col in 0..cols {
+        let start = col * body_rows;
+        if start >= lines.len() {
+            break;
+        }
+        let end = (start + body_rows).min(lines.len());
+        let x = inner.x + (col * col_w) as u16;
+        if x >= inner.x + inner.width {
+            break;
+        }
+        let width = (widest as u16).min(inner.width.saturating_sub(x - inner.x));
+        let column_area = Rect::new(x, body_y, width, body_height as u16);
+        frame.render_widget(Paragraph::new(lines[start..end].to_vec()), column_area);
+    }
 }
 
 fn render_prefix_hint_bar(app: &AppState, frame: &mut Frame, area: Rect) {

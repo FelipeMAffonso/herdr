@@ -5071,7 +5071,12 @@ mod tests {
         let deadline = app
             .prefix_which_key_deadline
             .expect("which-key deadline armed on prefix entry");
-        assert!(app.next_loop_deadline(now, false) == Some(deadline));
+        // The headless variant excludes the resize poll and git refresh, leaving the
+        // which-key deadline as the only pending wake-up in a fresh test app.
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(deadline)
+        );
 
         // Before the delay, nothing changes.
         assert!(!app.expire_prefix_which_key(deadline - Duration::from_millis(1)));

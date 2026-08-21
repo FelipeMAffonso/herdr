@@ -1552,8 +1552,12 @@ mod tests {
             .iter()
             .any(|(chord, description)| chord == "f" && description.as_ref() == "fuzzy find"));
 
-        // A built-in prefix binding shows its bare RHS (e.g. split vertical), never the
-        // "prefix+" form, and direct-only navigation keys are excluded.
+        // The user's custom bindings lead the list so they survive a small terminal.
+        assert_eq!(groups.first().map(|(name, _)| *name), Some("custom"));
+
+        // A built-in prefix binding shows its bare RHS (e.g. split vertical), never
+        // the "prefix+" form; indexed prefix bindings compact to their range; and
+        // direct-only navigation keys are excluded.
         let all: Vec<_> = groups
             .iter()
             .flat_map(|(_, entries)| entries.iter())
@@ -1561,11 +1565,13 @@ mod tests {
         assert!(all
             .iter()
             .any(|(chord, description)| chord == "v" && description.as_ref() == "split vertical"));
+        assert!(all.iter().any(
+            |(chord, description)| chord == "1..9" && description.as_ref() == "switch tab 1-9"
+        ));
         assert!(all.iter().all(|(chord, _)| !chord.contains("prefix+")));
     }
 
-    #[test]
-    fn prefix_which_key_popup_renders_within_small_frame() {
+    fn which_key_test_app() -> crate::app::state::AppState {
         let mut app = crate::app::state::AppState::test_new();
         app.mode = Mode::Prefix;
         app.prefix_which_key_expanded = true;
@@ -1578,26 +1584,52 @@ mod tests {
             width: None,
             height: None,
         }];
-        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 40, 16);
+        app
+    }
 
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 16))
+    fn render_which_key_to_text(app: &crate::app::state::AppState, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
             .expect("test terminal");
         terminal
-            .draw(|frame| render_prefix_overlay(&app, frame, app.view.terminal_area))
+            .draw(|frame| render_prefix_overlay(app, frame, app.view.terminal_area))
             .expect("draw which-key popup");
-
-        let rendered = terminal
+        terminal
             .backend()
             .buffer()
             .content()
             .iter()
             .map(|cell| cell.symbol())
-            .collect::<String>();
-        // The popup titles itself, lists a built-in and the custom command's description,
-        // all inside the frame (draw would have panicked on an out-of-bounds write).
+            .collect::<String>()
+    }
+
+    #[test]
+    fn prefix_which_key_popup_lists_bindings_within_terminal_bounds() {
+        let mut app = which_key_test_app();
+        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+
+        let rendered = render_which_key_to_text(&app, 100, 30);
+
+        // The popup titles itself and lists built-ins and the custom command's
+        // description, all inside the frame (an out-of-bounds write would have
+        // panicked the draw).
         assert!(rendered.contains("prefix"));
         assert!(rendered.contains("split vertical"));
+        assert!(rendered.contains("swap pane left"));
         assert!(rendered.contains("fuzzy find"));
+    }
+
+    #[test]
+    fn prefix_which_key_popup_survives_tiny_frame_with_more_marker() {
+        let mut app = which_key_test_app();
+        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 40, 8);
+
+        let rendered = render_which_key_to_text(&app, 40, 8);
+
+        // Too small for the whole list: the custom binding still leads, and the
+        // cut is announced instead of silent.
+        assert!(rendered.contains("prefix"));
+        assert!(rendered.contains("fuzzy find"));
+        assert!(rendered.contains("more"));
     }
 
     #[test]
