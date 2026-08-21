@@ -3367,9 +3367,15 @@ navigate_pane_down = "ctrl+j"
             app.state.prefix_mods,
         ))
         .await;
+        // First unmatched key reveals the which-key popup and stays in prefix
+        // mode; a second unmatched key exits.
         app.handle_key(TerminalKey::new(KeyCode::F(12), KeyModifiers::empty()))
             .await;
+        assert_eq!(app.state.mode, Mode::Prefix);
+        assert!(app.state.prefix_which_key_expanded);
 
+        app.handle_key(TerminalKey::new(KeyCode::F(12), KeyModifiers::empty()))
+            .await;
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
