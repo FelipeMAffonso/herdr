@@ -853,14 +853,6 @@ pub(crate) fn agent_entry_height_in_body(
         .min(body_height)
 }
 
-pub(crate) fn agent_entry_gap(app: &AppState, entry_idx: usize, entry_count: usize) -> u16 {
-    if entry_idx + 1 < entry_count {
-        app.sidebar_agents.row_gap
-    } else {
-        0
-    }
-}
-
 /// A display row in the agents panel: either a tag group header or an agent
 /// entry. Entries carry the index into [`agent_panel_entries`] so hit-testing
 /// resolves back to the same `AgentPanelEntry` the panel drew.
