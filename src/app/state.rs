@@ -1398,6 +1398,10 @@ pub struct AppState {
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
     pub mode: Mode,
+    /// While in `Mode::Prefix`, set once the which-key delay has elapsed or an
+    /// unbound key was pressed: the prefix overlay then expands from the slim hint
+    /// bar into the full which-key popup. Reset whenever prefix mode is left.
+    pub prefix_which_key_expanded: bool,
     pub should_quit: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
     pub detach_exits: bool,
@@ -1794,6 +1798,7 @@ impl AppState {
             previous_pane_focus: None,
             selected: 0,
             mode: Mode::Navigate,
+            prefix_which_key_expanded: false,
             should_quit: false,
             detach_exits: false,
             detach_requested: false,

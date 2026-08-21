@@ -59,6 +59,136 @@ fn indexed_range_prefix(bindings: &[crate::config::IndexedKeybind]) -> Option<&s
     Some(prefix)
 }
 
+/// One action's built-in keybinding paired with its human description. Both the
+/// keybind help overlay and the prefix which-key popup are derived from this list
+/// so the two surfaces can never drift apart (a hand-maintained help table is the
+/// drift the derivation exists to prevent).
+struct ActionDescriptor<'a> {
+    bindings: &'a crate::config::ActionKeybinds,
+    description: &'static str,
+}
+
+fn descriptor<'a>(
+    bindings: &'a crate::config::ActionKeybinds,
+    description: &'static str,
+) -> ActionDescriptor<'a> {
+    ActionDescriptor {
+        bindings,
+        description,
+    }
+}
+
+/// The built-in actions that can be reached through the prefix chord, grouped the
+/// same way the help overlay groups them. Direct-only navigation keys (esc, tab,
+/// arrows) are intentionally excluded: the which-key popup answers "after the
+/// prefix, what does the next key do?".
+fn prefix_action_groups(
+    kb: &crate::config::Keybinds,
+) -> Vec<(&'static str, Vec<ActionDescriptor>)> {
+    vec![
+        (
+            "global",
+            vec![
+                descriptor(&kb.help, "keybinds"),
+                descriptor(&kb.settings, "settings"),
+                descriptor(&kb.detach, "detach"),
+                descriptor(&kb.reload_config, "reload config"),
+                descriptor(&kb.open_notification_target, "open notification target"),
+            ],
+        ),
+        (
+            "workspaces / tabs",
+            vec![
+                descriptor(&kb.workspace_picker, "workspace navigation"),
+                descriptor(&kb.goto, "session navigator"),
+                descriptor(&kb.new_workspace, "new workspace"),
+                descriptor(&kb.new_worktree, "new worktree"),
+                descriptor(&kb.open_worktree, "open worktree"),
+                descriptor(&kb.remove_worktree, "delete worktree checkout"),
+                descriptor(&kb.rename_workspace, "rename workspace"),
+                descriptor(&kb.close_workspace, "close workspace"),
+                descriptor(&kb.previous_workspace, "previous workspace"),
+                descriptor(&kb.next_workspace, "next workspace"),
+                descriptor(&kb.previous_agent, "previous agent"),
+                descriptor(&kb.next_agent, "next agent"),
+                descriptor(&kb.new_tab, "new tab"),
+                descriptor(&kb.rename_tab, "rename tab"),
+                descriptor(&kb.previous_tab, "previous tab"),
+                descriptor(&kb.next_tab, "next tab"),
+                descriptor(&kb.move_tab_previous, "move tab left"),
+                descriptor(&kb.move_tab_next, "move tab right"),
+                descriptor(&kb.close_tab, "close tab"),
+            ],
+        ),
+        (
+            "panes",
+            vec![
+                descriptor(&kb.split_vertical, "split vertical"),
+                descriptor(&kb.split_horizontal, "split horizontal"),
+                descriptor(&kb.close_pane, "close pane"),
+                descriptor(&kb.rename_pane, "rename pane"),
+                descriptor(&kb.edit_scrollback, "edit scrollback"),
+                descriptor(&kb.copy_mode, "copy mode"),
+                descriptor(&kb.zoom, "zoom pane"),
+                descriptor(&kb.resize_mode, "resize mode"),
+                descriptor(&kb.resize_pane_left, "resize pane left"),
+                descriptor(&kb.resize_pane_down, "resize pane down"),
+                descriptor(&kb.resize_pane_up, "resize pane up"),
+                descriptor(&kb.resize_pane_right, "resize pane right"),
+                descriptor(&kb.toggle_sidebar, "toggle sidebar"),
+                descriptor(&kb.focus_pane_left, "focus pane left"),
+                descriptor(&kb.focus_pane_down, "focus pane down"),
+                descriptor(&kb.focus_pane_up, "focus pane up"),
+                descriptor(&kb.focus_pane_right, "focus pane right"),
+                descriptor(&kb.cycle_pane_next, "cycle pane next"),
+                descriptor(&kb.cycle_pane_previous, "cycle pane previous"),
+                descriptor(&kb.last_pane, "last pane"),
+            ],
+        ),
+    ]
+}
+
+/// The which-key entries shown while the prefix chord is held: every binding
+/// reachable as a prefix continuation, its bare chord beside its description,
+/// including the user's `[[keys.command]]` customs with their configured
+/// descriptions. Derived from `app.keybinds`, never a hand-maintained table.
+pub(crate) fn prefix_which_key_groups(app: &AppState) -> Vec<HelpGroup> {
+    let kb = &app.keybinds;
+    let mut groups: Vec<HelpGroup> = Vec::new();
+
+    for (name, actions) in prefix_action_groups(kb) {
+        let entries: Vec<HelpEntry> = actions
+            .into_iter()
+            .filter_map(|action| {
+                let chord = action.bindings.prefix_rhs_label()?;
+                Some((chord, Cow::Borrowed(action.description)))
+            })
+            .collect();
+        if !entries.is_empty() {
+            groups.push((name, entries));
+        }
+    }
+
+    let custom: Vec<HelpEntry> = kb
+        .custom_commands
+        .iter()
+        .filter_map(|binding| {
+            let chord = binding.bindings.prefix_rhs_label()?;
+            let description = binding
+                .description
+                .clone()
+                .map(Cow::Owned)
+                .unwrap_or(Cow::Borrowed("custom command"));
+            Some((chord, description))
+        })
+        .collect();
+    if !custom.is_empty() {
+        groups.push(("custom", custom));
+    }
+
+    groups
+}
+
 pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     let kb = &app.keybinds;
     let mut groups = Vec::new();

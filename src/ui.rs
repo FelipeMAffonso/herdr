@@ -597,7 +597,7 @@ fn _build_hints(items: &[(&str, &str)], key_style: Style, dim_style: Style) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::keybind_help::keybind_help_groups;
+    use super::keybind_help::{keybind_help_groups, prefix_which_key_groups};
     use super::scrollbar::scrollbar_thumb;
     use super::*;
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
@@ -1524,6 +1524,80 @@ mod tests {
             .join("");
         assert!(rendered_help.contains("open lazygit"));
         assert!(rendered_help.contains("custom command"));
+    }
+
+    #[test]
+    fn prefix_which_key_lists_custom_command_with_its_description() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("f"),
+            label: "prefix+f".to_string(),
+            command: "fzf".to_string(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: Some("fuzzy find".to_string()),
+            width: None,
+            height: None,
+        }];
+
+        let groups = prefix_which_key_groups(&app);
+
+        // The custom command shows its bare continuation chord and configured description.
+        let custom = groups
+            .iter()
+            .find(|(name, _)| *name == "custom")
+            .expect("custom group present")
+            .1
+            .clone();
+        assert!(custom
+            .iter()
+            .any(|(chord, description)| chord == "f" && description.as_ref() == "fuzzy find"));
+
+        // A built-in prefix binding shows its bare RHS (e.g. split vertical), never the
+        // "prefix+" form, and direct-only navigation keys are excluded.
+        let all: Vec<_> = groups
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .collect();
+        assert!(all
+            .iter()
+            .any(|(chord, description)| chord == "v" && description.as_ref() == "split vertical"));
+        assert!(all.iter().all(|(chord, _)| !chord.contains("prefix+")));
+    }
+
+    #[test]
+    fn prefix_which_key_popup_renders_within_small_frame() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Prefix;
+        app.prefix_which_key_expanded = true;
+        app.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("f"),
+            label: "prefix+f".to_string(),
+            command: "fzf".to_string(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: Some("fuzzy find".to_string()),
+            width: None,
+            height: None,
+        }];
+        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 40, 16);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 16))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| render_prefix_overlay(&app, frame, app.view.terminal_area))
+            .expect("draw which-key popup");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        // The popup titles itself, lists a built-in and the custom command's description,
+        // all inside the frame (draw would have panicked on an out-of-bounds write).
+        assert!(rendered.contains("prefix"));
+        assert!(rendered.contains("split vertical"));
+        assert!(rendered.contains("fuzzy find"));
     }
 
     #[test]

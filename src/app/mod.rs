@@ -44,6 +44,9 @@ const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+/// How long the prefix chord is held (with no follow-up key) before the which-key
+/// popup expands from the slim hint bar into the full binding list.
+const PREFIX_WHICH_KEY_DELAY: Duration = Duration::from_millis(600);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
@@ -137,6 +140,10 @@ pub struct App {
     /// should re-render. Armed on a pane state change, re-armed while any agent is
     /// working or needs attention, cleared to `None` when nothing needs animating.
     pub(crate) next_sidebar_animation: Option<Instant>,
+    /// When set, the instant the prefix which-key popup should expand from the slim
+    /// hint bar into the full binding list. Armed on entering `Mode::Prefix`, cleared
+    /// to `None` when prefix mode is left or the popup has already expanded.
+    pub(crate) prefix_which_key_deadline: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -550,6 +557,7 @@ impl App {
             previous_pane_focus: None,
             selected,
             mode,
+            prefix_which_key_expanded: false,
             should_quit: false,
             detach_exits: no_session,
             detach_requested: false,
@@ -775,6 +783,7 @@ impl App {
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_sidebar_animation: None,
+            prefix_which_key_deadline: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -903,7 +912,45 @@ impl App {
         self.full_redraw_pending = true;
     }
 
+    /// Arm or clear the which-key popup deadline as prefix mode is entered or left.
+    /// Called from the same choke points as `sync_prefix_input_source`, so every
+    /// path that changes the mode keeps the popup timing consistent. Entering prefix
+    /// arms the delay and starts collapsed; leaving prefix clears both the deadline
+    /// and the expanded flag so the next entry starts fresh.
+    pub(crate) fn sync_prefix_which_key(&mut self, previous_mode: Mode) {
+        let now = Instant::now();
+        match (previous_mode, self.state.mode) {
+            (before, Mode::Prefix) if before != Mode::Prefix => {
+                self.state.prefix_which_key_expanded = false;
+                self.prefix_which_key_deadline = Some(now + PREFIX_WHICH_KEY_DELAY);
+            }
+            (Mode::Prefix, after) if after != Mode::Prefix => {
+                self.state.prefix_which_key_expanded = false;
+                self.prefix_which_key_deadline = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// When the which-key delay has elapsed while still in prefix mode, expand the
+    /// popup and request a redraw. Returns true when a redraw is needed.
+    pub(crate) fn expire_prefix_which_key(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.prefix_which_key_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.prefix_which_key_deadline = None;
+        if self.state.mode == Mode::Prefix && !self.state.prefix_which_key_expanded {
+            self.state.prefix_which_key_expanded = true;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn sync_prefix_input_source(&mut self, previous_mode: Mode) {
+        self.sync_prefix_which_key(previous_mode);
         // Emit the input-source intent on entering/leaving the ASCII realm, like `ClipboardWrite`;
         // the foreground (client, or this app in monolithic mode) applies the switch. Keyed on the
         // realm so multi-level prefix commands stay ASCII. The switch is flag-gated but the restore
@@ -5010,6 +5057,36 @@ mod tests {
         app.next_sidebar_animation = Some(later - Duration::from_millis(1));
         app.handle_scheduled_tasks(later, false);
         assert!(app.next_sidebar_animation.is_none());
+    }
+
+    #[test]
+    fn prefix_which_key_arms_on_entry_and_expands_when_delay_elapses() {
+        let mut app = test_app();
+        let now = Instant::now();
+
+        // Entering prefix mode arms the delay and starts collapsed.
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_which_key(Mode::Terminal);
+        assert!(!app.state.prefix_which_key_expanded);
+        let deadline = app
+            .prefix_which_key_deadline
+            .expect("which-key deadline armed on prefix entry");
+        assert!(app.next_loop_deadline(now, false) == Some(deadline));
+
+        // Before the delay, nothing changes.
+        assert!(!app.expire_prefix_which_key(deadline - Duration::from_millis(1)));
+        assert!(!app.state.prefix_which_key_expanded);
+
+        // Once the delay elapses the popup expands and the deadline clears.
+        assert!(app.expire_prefix_which_key(deadline));
+        assert!(app.state.prefix_which_key_expanded);
+        assert!(app.prefix_which_key_deadline.is_none());
+
+        // Leaving prefix mode resets the popup so the next entry starts fresh.
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_which_key(Mode::Prefix);
+        assert!(!app.state.prefix_which_key_expanded);
+        assert!(app.prefix_which_key_deadline.is_none());
     }
 
     #[test]

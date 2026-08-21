@@ -340,6 +340,8 @@ impl App {
 
         changed |= self.tick_sidebar_animation(now);
 
+        changed |= self.expire_prefix_which_key(now);
+
         if self
             .config_diagnostic_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -656,6 +658,7 @@ impl App {
         [
             include_resize_poll.then_some(self.next_resize_poll),
             self.next_sidebar_animation,
+            self.prefix_which_key_deadline,
             self.config_diagnostic_deadline,
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),
