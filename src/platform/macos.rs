@@ -489,6 +489,13 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     )
 }
 
+/// File paths copied in Finder. Not wired yet on macOS: reading NSPasteboard's
+/// file URLs needs an osascript or objc call; until then the smart-paste falls
+/// through to image and text.
+pub fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    None
+}
+
 pub fn read_clipboard_text() -> Option<String> {
     const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 

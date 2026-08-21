@@ -110,6 +110,13 @@ pub enum AgentSidebarToken {
     Agent,
     TerminalTitle,
     TerminalTitleStripped,
+    /// A thin colored bar answering "does this agent need me": green when the
+    /// agent finished and waits unseen, red when blocked, yellow when idle,
+    /// blank while working.
+    NeedEdge,
+    /// "waiting 12m" - how long the agent has needed attention. Empty (row
+    /// elides) unless the agent is blocked or finished-and-unseen.
+    Waiting,
     Custom(String),
     Styled {
         token: Box<AgentSidebarToken>,
@@ -124,6 +131,10 @@ pub enum SpaceSidebarToken {
     Workspace,
     Branch,
     GitStatus,
+    /// A one-line summary of the agents living in this space: "N agents", with
+    /// "· M need you" appended when M of them are blocked or finished-and-unseen.
+    /// Elides (the row drops) when the space has no known agents.
+    Agents,
     Custom(String),
     Styled {
         token: Box<SpaceSidebarToken>,
@@ -240,6 +251,8 @@ fn agent_token_name(token: &AgentSidebarToken) -> String {
         AgentSidebarToken::Agent => "agent".into(),
         AgentSidebarToken::TerminalTitle => "terminal_title".into(),
         AgentSidebarToken::TerminalTitleStripped => "terminal_title_stripped".into(),
+        AgentSidebarToken::NeedEdge => "need_edge".into(),
+        AgentSidebarToken::Waiting => "waiting".into(),
         AgentSidebarToken::Custom(name) => format!("${name}"),
         AgentSidebarToken::Styled { token, .. } => agent_token_name(token),
     }
@@ -252,6 +265,7 @@ fn space_token_name(token: &SpaceSidebarToken) -> String {
         SpaceSidebarToken::Workspace => "workspace".into(),
         SpaceSidebarToken::Branch => "branch".into(),
         SpaceSidebarToken::GitStatus => "git_status".into(),
+        SpaceSidebarToken::Agents => "agents".into(),
         SpaceSidebarToken::Custom(name) => format!("${name}"),
         SpaceSidebarToken::Styled { token, .. } => space_token_name(token),
     }
@@ -294,6 +308,8 @@ impl<'de> Deserialize<'de> for AgentSidebarToken {
                 ("agent", Self::Agent),
                 ("terminal_title", Self::TerminalTitle),
                 ("terminal_title_stripped", Self::TerminalTitleStripped),
+                ("need_edge", Self::NeedEdge),
+                ("waiting", Self::Waiting),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -338,6 +354,7 @@ impl<'de> Deserialize<'de> for SpaceSidebarToken {
                 ("workspace", Self::Workspace),
                 ("branch", Self::Branch),
                 ("git_status", Self::GitStatus),
+                ("agents", Self::Agents),
             ],
         )
         .map_err(serde::de::Error::custom)?;
@@ -404,12 +421,26 @@ impl Default for AgentsSidebarConfig {
     }
 }
 
+/// How tag groups order themselves in the spaces list (and the inherited agent
+/// groups). `Manual` follows the persisted `tag_order`; `Name` sorts groups
+/// alphabetically; `FirstAppearance` keeps today's order (the order tags first
+/// appear among the workspaces). Manual is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagSortMode {
+    #[default]
+    Manual,
+    Name,
+    FirstAppearance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SpacesSidebarConfig {
     #[serde(deserialize_with = "deserialize_sidebar_rows")]
     pub rows: SpaceSidebarRows,
     pub row_gap: u16,
+    pub tag_sort: TagSortMode,
 }
 
 impl Default for SpacesSidebarConfig {
@@ -420,6 +451,7 @@ impl Default for SpacesSidebarConfig {
                 vec![SpaceSidebarToken::Branch, SpaceSidebarToken::GitStatus],
             ],
             row_gap: DEFAULT_SIDEBAR_ROW_GAP,
+            tag_sort: TagSortMode::default(),
         }
     }
 }
@@ -459,6 +491,26 @@ mod tests {
             ]
         );
         assert_eq!(config.spaces.row_gap, 0);
+    }
+
+    #[test]
+    fn spaces_tag_sort_defaults_to_manual_and_parses_the_modes() {
+        assert_eq!(SpacesSidebarConfig::default().tag_sort, TagSortMode::Manual);
+        for (raw, expected) in [
+            ("manual", TagSortMode::Manual),
+            ("name", TagSortMode::Name),
+            ("first_appearance", TagSortMode::FirstAppearance),
+        ] {
+            let input = format!("[ui.sidebar.spaces]\ntag_sort = \"{raw}\"\n");
+            let config: crate::config::Config = toml::from_str(&input).expect("tag_sort config");
+            assert_eq!(config.ui.sidebar.spaces.tag_sort, expected);
+        }
+    }
+
+    #[test]
+    fn spaces_tag_sort_rejects_unknown_mode() {
+        let input = "[ui.sidebar.spaces]\ntag_sort = \"chronological\"\n";
+        assert!(toml::from_str::<crate::config::Config>(input).is_err());
     }
 
     #[test]
@@ -511,6 +563,46 @@ row_gap = 3
             vec![SpaceSidebarToken::Custom("jj_status".into())]
         );
         assert_eq!(config.ui.sidebar.spaces.row_gap, 3);
+    }
+
+    #[test]
+    fn parses_and_serializes_the_agents_space_token() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["agents"]]
+"#,
+        )
+        .expect("agents space token config");
+
+        assert_eq!(
+            config.ui.sidebar.spaces.rows[1],
+            vec![SpaceSidebarToken::Agents]
+        );
+        assert_eq!(space_token_name(&SpaceSidebarToken::Agents), "agents");
+    }
+
+    #[test]
+    fn parses_need_edge_and_waiting_tokens() {
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[ui.sidebar.agents]
+rows = [["need_edge", "state_icon", "workspace"], ["need_edge", "waiting"]]
+"#,
+        )
+        .expect("need edge config");
+
+        assert_eq!(
+            config.ui.sidebar.agents.rows,
+            vec![
+                vec![
+                    AgentSidebarToken::NeedEdge,
+                    AgentSidebarToken::StateIcon,
+                    AgentSidebarToken::Workspace,
+                ],
+                vec![AgentSidebarToken::NeedEdge, AgentSidebarToken::Waiting],
+            ]
+        );
     }
 
     #[test]

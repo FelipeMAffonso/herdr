@@ -467,6 +467,13 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
+/// File paths copied in a file manager (text/uri-list). Not wired yet on Linux:
+/// needs a wl-paste/xclip uri-list read plus URI decoding; until then the
+/// smart-paste falls through to image and text.
+pub fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    None
+}
+
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     Command::new("xdg-open")
         .arg(url)

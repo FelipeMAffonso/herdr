@@ -2,11 +2,12 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, Paragraph},
     Frame,
 };
 
-use super::widgets::{panel_contrast_fg, render_panel_shell};
+use super::keybind_help::prefix_which_key_groups;
+use super::widgets::{centered_popup_rect, panel_contrast_fg, render_panel_shell};
 use crate::app::AppState;
 
 fn prefix_rhs_label(bindings: &crate::config::ActionKeybinds) -> String {
@@ -29,6 +30,16 @@ fn render_bottom_bar(frame: &mut Frame, area: Rect, line: Line<'_>, bg: ratatui:
 }
 
 pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    // Once the prefix has been held past the which-key delay, or an unbound key was
+    // pressed, expand into the full which-key popup listing every continuation. The
+    // slim bottom bar stays the instant, low-noise hint for the muscle-memory case.
+    // The popup centers on the terminal surface, not the mode-bar row: with a
+    // bottom tab bar `area` is that single row and could never hold a card.
+    if app.prefix_which_key_expanded {
+        render_prefix_which_key_popup(app, frame, app.view.terminal_area, area);
+        return;
+    }
+
     let key = Style::default()
         .fg(app.palette.accent)
         .add_modifier(Modifier::BOLD);
@@ -55,6 +66,156 @@ pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rec
         Span::styled(" keybinds", dim),
     ]);
 
+    let overlay_y = area.y + area.height.saturating_sub(1);
+    let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
+    render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
+}
+
+/// The which-key card: after the prefix chord, a rounded panel listing every
+/// bound continuation (built-ins plus `[[keys.command]]` customs with their
+/// descriptions) so nothing rests on memory. Laid out in as many columns as fit
+/// so the whole list is visible on ordinary terminals; when even that cannot fit,
+/// the last visible row becomes a "+N more" count rather than a silent cut.
+/// `area` hosts the centered card; `bar_area` hosts the slim fallback bar when
+/// the card cannot fit at all.
+fn render_prefix_which_key_popup(app: &AppState, frame: &mut Frame, area: Rect, bar_area: Rect) {
+    let groups = prefix_which_key_groups(app);
+
+    // Flatten into rendered lines: a bold heading per group, then one row per
+    // binding ("chord  description"), a blank line between groups.
+    let heading_style = Style::default()
+        .fg(app.palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(app.palette.mauve)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(app.palette.text);
+    let dim_style = Style::default().fg(app.palette.overlay0);
+
+    let chord_width = groups
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().map(|(chord, _)| chord.chars().count()))
+        .max()
+        .unwrap_or(1);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (group, entries) in &groups {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(format!(" {group}"), heading_style)));
+        for (chord, description) in entries {
+            let padded = format!(" {:<width$} ", chord, width = chord_width);
+            lines.push(Line::from(vec![
+                Span::styled(padded, key_style),
+                Span::styled(description.clone().into_owned(), label_style),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        render_prefix_hint_bar(app, frame, bar_area);
+        return;
+    }
+
+    // Column layout. A column is as wide as the widest line plus a two-cell
+    // gutter; the popup carries a border (2 rows/cols) and a one-row title.
+    let title = " prefix ";
+    let title_hint = "next key";
+    let total = lines.len();
+    let widest = lines
+        .iter()
+        .map(ratatui::text::Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.len() + title_hint.len())
+        .max(1);
+    let col_w = widest + 2;
+
+    let avail_w = area.width.saturating_sub(4) as usize;
+    let avail_h = area.height.saturating_sub(2) as usize;
+    let max_body_rows = avail_h.saturating_sub(3);
+    if max_body_rows == 0 || avail_w < 4 {
+        render_prefix_hint_bar(app, frame, bar_area);
+        return;
+    }
+    let max_cols = (avail_w / col_w).max(1);
+    let cols = total.div_ceil(max_body_rows).min(max_cols);
+    let body_rows = total.div_ceil(cols).min(max_body_rows);
+    let shown = (cols * body_rows).min(total);
+    if shown < total {
+        // Not everything fits even in columns: the last visible row says how much
+        // is hidden instead of cutting the list silently.
+        let hidden = total - shown + 1;
+        lines[shown - 1] = Line::from(Span::styled(format!(" +{hidden} more"), dim_style));
+    }
+
+    let popup_w = ((cols * col_w) as u16).min(area.width);
+    let popup_h = ((body_rows + 3) as u16).min(area.height);
+    let Some(popup) = centered_popup_rect(area, popup_w, popup_h) else {
+        // Too small for the card: fall back to the slim bar so the mode is never invisible.
+        render_prefix_hint_bar(app, frame, bar_area);
+        return;
+    };
+    let Some(inner) = render_panel_shell(frame, popup, app.palette.surface1, app.palette.panel_bg)
+    else {
+        render_prefix_hint_bar(app, frame, bar_area);
+        return;
+    };
+    if inner.height < 2 || inner.width < 2 {
+        return;
+    }
+
+    let title_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(app.palette.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(title_hint, dim_style),
+        ])),
+        title_area,
+    );
+
+    let body_y = inner.y + 1;
+    let body_height = (inner.height.saturating_sub(1) as usize).min(body_rows);
+    if body_height == 0 {
+        return;
+    }
+    lines.truncate(shown);
+    for col in 0..cols {
+        let start = col * body_rows;
+        if start >= lines.len() {
+            break;
+        }
+        let end = (start + body_rows).min(lines.len());
+        let x = inner.x + (col * col_w) as u16;
+        if x >= inner.x + inner.width {
+            break;
+        }
+        let width = (widest as u16).min(inner.width.saturating_sub(x - inner.x));
+        let column_area = Rect::new(x, body_y, width, body_height as u16);
+        frame.render_widget(Paragraph::new(lines[start..end].to_vec()), column_area);
+    }
+}
+
+fn render_prefix_hint_bar(app: &AppState, frame: &mut Frame, area: Rect) {
+    let key = Style::default()
+        .fg(app.palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(app.palette.overlay0);
+    let mode_style = Style::default()
+        .fg(panel_contrast_fg(&app.palette))
+        .bg(app.palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let line = Line::from(vec![
+        Span::styled(" PREFIX ", mode_style),
+        Span::raw(" "),
+        Span::styled("esc", key),
+        Span::styled(" cancel", dim),
+    ]);
     let overlay_y = area.y + area.height.saturating_sub(1);
     let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
     render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
@@ -292,24 +453,67 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
     let Some(menu_rect) = app.context_menu_rect() else {
         return;
     };
-    let Some(inner) = render_panel_shell(frame, menu_rect, p.accent, p.panel_bg) else {
+    // The polish pass: a quiet border (the accent belongs to the selection, not
+    // the frame), and the selected row drawn the editor way - a subtle selection
+    // background under the whole row with a thin accent bar at its left edge,
+    // instead of a loud full-accent block.
+    let Some(inner) = render_panel_shell(frame, menu_rect, p.surface1, p.panel_bg) else {
         return;
     };
 
-    let items: Vec<ListItem> = menu
-        .items()
-        .iter()
-        .map(|item| ListItem::new(Line::from(*item)))
-        .collect();
-    let list = List::new(items)
-        .style(Style::default().fg(p.text))
-        .highlight_style(
-            Style::default()
-                .bg(p.accent)
-                .fg(panel_contrast_fg(p))
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(" ");
-    let mut state = ListState::default().with_selected(Some(menu.list.highlighted));
-    frame.render_stateful_widget(list, inner, &mut state);
+    // The tag color picker prefixes each accent name with a swatch glyph in that
+    // accent's own color, so the choice reads by color as well as by name.
+    let swatch_color = |idx: usize| -> Option<ratatui::style::Color> {
+        match &menu.kind {
+            crate::app::state::ContextMenuKind::TagColor { .. } => crate::ui::TagAccent::ALL
+                .get(idx)
+                .map(|accent| accent.color(p)),
+            _ => None,
+        }
+    };
+
+    for (idx, item) in menu.items().iter().enumerate() {
+        let y = inner.y + idx as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect::new(inner.x, y, inner.width, 1);
+        let selected = idx == menu.list.highlighted;
+        let swatch = swatch_color(idx);
+        if selected {
+            let row_bg = Style::default().bg(p.selection_bg);
+            let buf = frame.buffer_mut();
+            for x in row.x..row.x + row.width {
+                buf[(x, y)].set_style(row_bg);
+            }
+            let mut spans = vec![Span::styled(
+                "▎",
+                Style::default().fg(p.accent).bg(p.selection_bg),
+            )];
+            if let Some(color) = swatch {
+                spans.push(Span::styled(
+                    "● ",
+                    Style::default().fg(color).bg(p.selection_bg),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{item} "),
+                Style::default()
+                    .fg(p.text)
+                    .bg(p.selection_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        } else {
+            let mut spans = vec![Span::raw(" ")];
+            if let Some(color) = swatch {
+                spans.push(Span::styled("● ", Style::default().fg(color)));
+            }
+            spans.push(Span::styled(
+                format!("{item} "),
+                Style::default().fg(p.text),
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), row);
+        }
+    }
 }

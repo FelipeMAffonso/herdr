@@ -23,6 +23,29 @@ impl AppState {
         detail_area
     }
 
+    /// Move the tag group `tag` one slot up (`up = true`) or down in the display
+    /// order, writing the full resulting order into `tag_order` and flipping the
+    /// sort mode to Manual (a manual edit always wins over name/first-appearance
+    /// ordering). A no-op when the tag is already at the edge, or not a group.
+    pub(crate) fn move_tag_group(&mut self, tag: &str, up: bool) {
+        let mut order = crate::ui::ordered_tag_names(self);
+        let Some(pos) = order.iter().position(|name| name == tag) else {
+            return;
+        };
+        let swap_with = if up {
+            pos.checked_sub(1)
+        } else {
+            (pos + 1 < order.len()).then_some(pos + 1)
+        };
+        let Some(swap_with) = swap_with else {
+            return;
+        };
+        order.swap(pos, swap_with);
+        self.tag_order = order;
+        self.sidebar_spaces.tag_sort = crate::config::TagSortMode::Manual;
+        self.mark_session_dirty();
+    }
+
     pub(super) fn workspace_list_scrollbar_target_at(
         &self,
         col: u16,
@@ -312,7 +335,27 @@ impl AppState {
         };
 
         cards.iter().find_map(|card| {
-            (row >= card.rect.y && row < card.rect.y + card.rect.height).then_some(card.ws_idx)
+            (!card.is_tag_header && row >= card.rect.y && row < card.rect.y + card.rect.height)
+                .then_some(card.ws_idx)
+        })
+    }
+
+    /// The tag name of the spaces-list group header at `row`, or `None` when the
+    /// row is not a header. Drives right-click header menus.
+    pub(super) fn tag_header_at_row(&self, row: u16) -> Option<String> {
+        let cards = if self.view.workspace_card_areas.is_empty() {
+            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+        } else {
+            self.view.workspace_card_areas.clone()
+        };
+        cards.iter().find_map(|card| {
+            (card.is_tag_header && row >= card.rect.y && row < card.rect.y + card.rect.height)
+                .then(|| {
+                    self.workspaces
+                        .get(card.ws_idx)
+                        .and_then(|ws| ws.tag().map(str::to_string))
+                })
+                .flatten()
         })
     }
 
@@ -503,18 +546,65 @@ impl AppState {
         let mut row_y = body.y;
         let body_bottom = body.y + body.height;
         let entries = crate::ui::agent_panel_entries(self);
+        let display_rows = crate::ui::agent_panel_display_rows(self, &entries);
         let scroll = self.agent_panel_scroll.min(metrics.max_offset_from_bottom);
-        for (index, detail) in entries.iter().enumerate().skip(scroll) {
-            let height = crate::ui::agent_entry_height_in_body(self, detail, body.height);
+        for (index, drow) in display_rows.iter().enumerate().skip(scroll) {
+            let gap = crate::ui::agent_display_row_gap(self, &display_rows, index);
+            let height = crate::ui::agent_display_row_height(self, &entries, drow, body.height);
             if row_y.saturating_add(height) > body_bottom {
                 break;
             }
-            if row >= row_y && row < row_y.saturating_add(height) {
-                return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
+            if let crate::ui::AgentPanelRow::Entry { entry_idx } = drow {
+                if row >= row_y && row < row_y.saturating_add(height) {
+                    if let Some(detail) = entries.get(*entry_idx) {
+                        return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
+                    }
+                }
             }
             row_y = row_y
                 .saturating_add(height)
-                .saturating_add(crate::ui::agent_entry_gap(self, index, entries.len()))
+                .saturating_add(gap)
+                .min(body_bottom);
+        }
+        None
+    }
+
+    /// The tag whose agents-panel header sits at `row`, if any, mapped through
+    /// the scrolled display-row list. Clicking a header toggles its collapse.
+    pub(super) fn agent_tag_header_at(&self, row: u16) -> Option<String> {
+        if self.sidebar_collapsed {
+            return None;
+        }
+
+        let detail_area = self.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(self, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        if body.height == 0 || row < body.y || row >= body.y + body.height {
+            return None;
+        }
+
+        let mut row_y = body.y;
+        let body_bottom = body.y + body.height;
+        let entries = crate::ui::agent_panel_entries(self);
+        let display_rows = crate::ui::agent_panel_display_rows(self, &entries);
+        let scroll = self.agent_panel_scroll.min(metrics.max_offset_from_bottom);
+        for (index, drow) in display_rows.iter().enumerate().skip(scroll) {
+            let gap = crate::ui::agent_display_row_gap(self, &display_rows, index);
+            let height = crate::ui::agent_display_row_height(self, &entries, drow, body.height);
+            if row_y.saturating_add(height) > body_bottom {
+                break;
+            }
+            if let crate::ui::AgentPanelRow::Header { tag, .. } = drow {
+                if row >= row_y && row < row_y.saturating_add(height) {
+                    return Some(tag.clone());
+                }
+            }
+            row_y = row_y
+                .saturating_add(height)
+                .saturating_add(gap)
                 .min(body_bottom);
         }
         None
@@ -915,6 +1005,152 @@ mod tests {
             app.state.workspaces[1].tabs[0].layout.focused(),
             second_pane
         );
+    }
+
+    /// Build a mouse-test app with one tagged, agent-carrying workspace per spec,
+    /// realize the sidebar layout, and return it ready to hit-test the agents panel.
+    fn app_with_tagged_agents(specs: &[(&str, Option<&str>)]) -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = specs
+            .iter()
+            .map(|(name, tag)| {
+                let mut ws = Workspace::test_new(name);
+                ws.set_tag(tag.map(str::to_string));
+                ws
+            })
+            .collect();
+        app.state.ensure_test_terminals();
+        for ws_idx in 0..app.state.workspaces.len() {
+            let pane = app.state.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .detected_agent = Some(Agent::Claude);
+        }
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+        app
+    }
+
+    /// The body row where the agents-panel header for `tag` currently sits, and
+    /// the row of the first entry under it, resolved by walking the display list.
+    fn agent_header_and_member_rows(app: &crate::app::App, tag: &str) -> (u16, u16) {
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        let entries = crate::ui::agent_panel_entries(&app.state);
+        let rows = crate::ui::agent_panel_display_rows(&app.state, &entries);
+        let mut row_y = body.y;
+        let mut header_row = None;
+        for (index, drow) in rows.iter().enumerate() {
+            let height =
+                crate::ui::agent_display_row_height(&app.state, &entries, drow, body.height);
+            match drow {
+                crate::ui::AgentPanelRow::Header { tag: t, .. } if t == tag => {
+                    header_row = Some(row_y);
+                }
+                crate::ui::AgentPanelRow::Entry { .. } if header_row.is_some() => {
+                    return (header_row.unwrap(), row_y);
+                }
+                _ => {}
+            }
+            row_y = row_y
+                .saturating_add(height)
+                .saturating_add(crate::ui::agent_display_row_gap(&app.state, &rows, index));
+        }
+        panic!("no header+member pair found for tag {tag:?}");
+    }
+
+    #[test]
+    fn clicking_agent_tag_header_toggles_collapse_under_agent_scoped_key() {
+        let mut app = app_with_tagged_agents(&[("alpha", Some("research"))]);
+        let (header_row, _) = agent_header_and_member_rows(&app, "research");
+        let key = crate::ui::agent_tag_collapse_key("research");
+        let spaces_key = crate::ui::tag_collapse_key("research");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.state.agent_panel_rect().x + 2,
+            header_row,
+        ));
+        assert!(app.state.collapsed_space_keys.contains(&key));
+        // The spaces list stays open: the agents panel uses its own key.
+        assert!(!app.state.collapsed_space_keys.contains(&spaces_key));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.state.agent_panel_rect().x + 2,
+            header_row,
+        ));
+        assert!(!app.state.collapsed_space_keys.contains(&key));
+    }
+
+    #[test]
+    fn clicking_agent_row_under_a_header_focuses_that_workspace_by_label() {
+        let mut app =
+            app_with_tagged_agents(&[("alpha", Some("research")), ("bravo", Some("research"))]);
+        // Resolve the member row for the "bravo" workspace by its label rather
+        // than a fixed index: find the entry whose ws label is "bravo".
+        let entries = crate::ui::agent_panel_entries(&app.state);
+        let bravo_ws = app
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.display_name() == "bravo")
+            .unwrap();
+        assert!(entries.iter().any(|e| e.ws_idx == bravo_ws));
+
+        let (_, first_member_row) = agent_header_and_member_rows(&app, "research");
+        // The first member row belongs to "alpha" (first appearance); clicking it
+        // focuses alpha. Assert by the resolved workspace label, never by index.
+        let target = app.state.agent_detail_target_at(first_member_row).unwrap();
+        let focused_label = app.state.workspaces[target.0].display_name();
+        assert_eq!(focused_label, "alpha");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.state.agent_panel_rect().x + 2,
+            first_member_row,
+        ));
+        assert_eq!(app.state.workspaces[target.0].display_name(), "alpha");
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn collapsing_an_agent_tag_group_hides_its_member_rows_from_hit_testing() {
+        let mut app = app_with_tagged_agents(&[("alpha", Some("research")), ("bravo", None)]);
+        let (header_row, member_row) = agent_header_and_member_rows(&app, "research");
+        // Before collapse the member row resolves to the research member "alpha".
+        let before = app.state.agent_detail_target_at(member_row).unwrap();
+        assert_eq!(app.state.workspaces[before.0].display_name(), "alpha");
+
+        // Collapse via the header click, then recompute the view so card/scroll
+        // state reflects the hidden members.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            app.state.agent_panel_rect().x + 2,
+            header_row,
+        ));
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        // The header still resolves at its row; the row that used to be the member
+        // no longer resolves to the hidden "alpha" agent.
+        assert_eq!(
+            app.state.agent_tag_header_at(header_row).as_deref(),
+            Some("research")
+        );
+        if let Some(target) = app.state.agent_detail_target_at(member_row) {
+            assert_ne!(app.state.workspaces[target.0].display_name(), "alpha");
+        }
     }
 
     #[test]

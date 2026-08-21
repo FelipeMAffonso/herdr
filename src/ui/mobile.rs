@@ -1224,6 +1224,7 @@ mod tests {
             state: AgentState::Idle,
             seen: true,
             last_agent_state_change_seq: None,
+            last_agent_state_change_at: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
         }
@@ -1292,10 +1293,18 @@ mod tests {
             .into_iter()
             .map(|(text, _)| text)
             .collect();
-        assert_eq!(
-            labels,
-            ["× 2 blocked", "✓ 1 done", "◐ 2 working", "○ 1 idle"]
-        );
+        // The non-working segments carry their fixed glyphs; the working segment
+        // now animates through the braille spinner, so its symbol is one of the
+        // spinner frames rather than a fixed "◐".
+        assert_eq!(labels[0], "× 2 blocked");
+        assert_eq!(labels[1], "✓ 1 done");
+        assert_eq!(labels[3], "○ 1 idle");
+        let working = &labels[2];
+        let (frame, rest) = working
+            .split_once(' ')
+            .expect("working segment has a leading symbol");
+        assert!(crate::ui::status::WORKING_SPINNER_FRAMES.contains(&frame));
+        assert_eq!(rest, "2 working");
     }
 
     #[test]

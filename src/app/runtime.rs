@@ -7,7 +7,7 @@ use crossterm::terminal;
 
 use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
-    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL, SIDEBAR_ANIMATION_INTERVAL,
 };
 fn retain_detached_process_after_wait(
     pid: u32,
@@ -287,6 +287,47 @@ impl App {
         false
     }
 
+    /// True while the sidebar has something worth re-rendering on a timer: an
+    /// agent actively working (the spinner animates) or an agent needing
+    /// attention (blocked, or done-and-unseen — the waiting counters refresh).
+    pub(crate) fn sidebar_animation_active(&self) -> bool {
+        self.state.workspaces.iter().any(|ws| {
+            matches!(
+                ws.aggregate_state(&self.state.terminals),
+                (crate::detect::AgentState::Working, _)
+                    | (crate::detect::AgentState::Blocked, _)
+                    | (crate::detect::AgentState::Idle, false)
+            )
+        })
+    }
+
+    /// Arm the sidebar animation timer if it is not already running and there is
+    /// something to animate. Called when a pane state change lands.
+    pub(crate) fn arm_sidebar_animation(&mut self, now: Instant) {
+        if self.next_sidebar_animation.is_none() && self.sidebar_animation_active() {
+            self.next_sidebar_animation = Some(now);
+        }
+    }
+
+    /// If the sidebar animation timer is due, fire it: request a redraw and
+    /// re-arm only while there is still something animating, otherwise stop the
+    /// timer. Returns true when it fired (the caller must redraw). The spinner
+    /// frame and waiting counters are derived at render time, so a redraw is all
+    /// the tick needs to do. Shared by the interactive and headless loops so the
+    /// 120ms cadence and active-only re-arm live in exactly one place.
+    pub(crate) fn tick_sidebar_animation(&mut self, now: Instant) -> bool {
+        if self
+            .next_sidebar_animation
+            .is_none_or(|deadline| now < deadline)
+        {
+            return false;
+        }
+        self.next_sidebar_animation = self
+            .sidebar_animation_active()
+            .then(|| now + SIDEBAR_ANIMATION_INTERVAL);
+        true
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
@@ -296,6 +337,10 @@ impl App {
             changed |= resized;
             self.next_resize_poll = now + RESIZE_POLL_INTERVAL;
         }
+
+        changed |= self.tick_sidebar_animation(now);
+
+        changed |= self.expire_prefix_which_key(now);
 
         if self
             .config_diagnostic_deadline
@@ -612,6 +657,8 @@ impl App {
 
         [
             include_resize_poll.then_some(self.next_resize_poll),
+            self.next_sidebar_animation,
+            self.prefix_which_key_deadline,
             self.config_diagnostic_deadline,
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),

@@ -18,10 +18,12 @@ pub(super) fn render_panel_shell(
         return None;
     }
 
+    // ROUNDED, not PLAIN (the polish pass): every floating panel - context menus,
+    // the launcher, modals - reads as a card instead of a DOS box.
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
-        .border_set(ratatui::symbols::border::PLAIN)
+        .border_set(ratatui::symbols::border::ROUNDED)
         .style(Style::default().bg(bg));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);

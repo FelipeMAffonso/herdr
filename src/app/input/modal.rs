@@ -375,10 +375,129 @@ pub(super) fn open_rename_workspace(
     state.pending_workspace_create_cwd = None;
     state.selected = ws_idx;
     state.rename_pane_target = None;
+    state.tag_edit_target = None;
+    state.tag_rename_from = None;
     state.name_input =
         state.workspaces[ws_idx].display_name_from(&state.terminals, terminal_runtimes);
     state.name_input_replace_on_type = false;
     state.mode = Mode::RenameWorkspace;
+}
+
+pub(super) fn open_tag_workspace(state: &mut AppState, ws_idx: usize) {
+    state.pending_workspace_create_cwd = None;
+    state.selected = ws_idx;
+    state.rename_pane_target = None;
+    state.tag_edit_target = Some(ws_idx);
+    state.tag_rename_from = None;
+    state.name_input = state
+        .workspaces
+        .get(ws_idx)
+        .and_then(|ws| ws.tag().map(str::to_string))
+        .unwrap_or_default();
+    state.name_input_replace_on_type = state.name_input.is_empty();
+    state.mode = Mode::RenameWorkspace;
+}
+
+/// Open the rename overlay to rename a tag across every workspace that carries it.
+/// Reuses `Mode::RenameWorkspace`; `tag_rename_from` records the tag being renamed.
+pub(super) fn open_rename_tag(state: &mut AppState, ws_idx: usize) {
+    let Some(current) = state
+        .workspaces
+        .get(ws_idx)
+        .and_then(|ws| ws.tag().map(str::to_string))
+    else {
+        return;
+    };
+    state.pending_workspace_create_cwd = None;
+    state.selected = ws_idx;
+    state.rename_pane_target = None;
+    state.tag_edit_target = None;
+    state.tag_rename_from = Some(current.clone());
+    state.name_input = current;
+    state.name_input_replace_on_type = false;
+    state.mode = Mode::RenameWorkspace;
+}
+
+/// Carry every per-tag-name side table across a tag rename so the renamed group
+/// keeps its collapse state (both panels), its color override, and its place in
+/// the manual order. When the target name already exists (a merge), the target's
+/// own color and order slot win: the old tag's color moves only into an empty
+/// slot, and the old name is dropped from the order rather than duplicating the
+/// target.
+pub(super) fn migrate_tag_keys(state: &mut AppState, old_tag: &str, new_tag: &str) {
+    if old_tag == new_tag {
+        return;
+    }
+    // Collapse state, spaces panel.
+    let old_key = crate::ui::tag_collapse_key(old_tag);
+    if state.collapsed_space_keys.remove(&old_key) {
+        state
+            .collapsed_space_keys
+            .insert(crate::ui::tag_collapse_key(new_tag));
+    }
+    // Collapse state, agents panel (keyed separately so a tag can be collapsed in
+    // one panel and open in the other).
+    let old_agent_key = crate::ui::agent_tag_collapse_key(old_tag);
+    if state.collapsed_space_keys.remove(&old_agent_key) {
+        state
+            .collapsed_space_keys
+            .insert(crate::ui::agent_tag_collapse_key(new_tag));
+    }
+    // Color override: move to the new name, but never clobber an existing color on
+    // the target (a merge keeps the surviving tag's color).
+    if let Some(color) = state.tag_colors.remove(old_tag) {
+        state.tag_colors.entry(new_tag.to_string()).or_insert(color);
+    }
+    // Manual order: rename the slot in place, unless the target is already listed
+    // (a merge), in which case drop the old slot rather than duplicate.
+    if let Some(pos) = state.tag_order.iter().position(|name| name == old_tag) {
+        if state.tag_order.iter().any(|name| name == new_tag) {
+            state.tag_order.remove(pos);
+        } else {
+            state.tag_order[pos] = new_tag.to_string();
+        }
+    }
+}
+
+/// Open the rename-tag overlay for a tag identified by name (the tag header menu
+/// has no single owning workspace). Mirrors [`open_rename_tag`] but takes the tag
+/// directly rather than resolving it from a workspace.
+pub(super) fn open_rename_tag_by_name(state: &mut AppState, tag: String) {
+    state.pending_workspace_create_cwd = None;
+    state.rename_pane_target = None;
+    state.tag_edit_target = None;
+    state.tag_rename_from = Some(tag.clone());
+    state.name_input = tag;
+    state.name_input_replace_on_type = false;
+    state.mode = Mode::RenameWorkspace;
+}
+
+/// Open the tag color picker for `tag`: a context menu whose rows are the theme
+/// accents, positioned where the originating menu sat. Reuses the context-menu
+/// list machinery via a dedicated `TagColor` kind.
+pub(super) fn open_tag_color_picker(state: &mut AppState, tag: String, x: u16, y: u16) {
+    state.context_menu = Some(ContextMenuState {
+        kind: ContextMenuKind::TagColor { tag },
+        x,
+        y,
+        list: MenuListState::new(0),
+    });
+    state.mode = Mode::ContextMenu;
+}
+
+/// Apply a picked accent to a tag name, persisting it in `tag_colors`. The label
+/// is the picker's displayed accent name; an unknown label is a no-op.
+pub(super) fn apply_tag_color(state: &mut AppState, tag: &str, accent_label: &str) {
+    let Some(accent) = crate::ui::TagAccent::ALL
+        .into_iter()
+        .find(|accent| accent.label() == accent_label)
+    else {
+        return;
+    };
+    state
+        .tag_colors
+        .insert(tag.to_string(), accent.id().to_string());
+    state.mark_session_dirty();
 }
 
 pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::PathBuf) {
@@ -387,6 +506,8 @@ pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::Pa
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
     state.rename_pane_target = None;
+    state.tag_edit_target = None;
+    state.tag_rename_from = None;
     state.name_input = suggested_name;
     state.name_input_replace_on_type = true;
     state.mode = Mode::RenameWorkspace;
@@ -802,13 +923,40 @@ pub(super) fn apply_context_menu_action(
             leave_modal(state);
         }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Rename"),
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
+            open_tag_workspace(state, ws_idx);
+        }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Rename tag...")) => {
+            open_rename_tag(state, ws_idx);
+        }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag color...")) => {
+            if let Some(tag) = state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.tag().map(str::to_string))
+            {
+                let (x, y) = (menu.x, menu.y);
+                open_tag_color_picker(state, tag, x, y);
+            } else {
+                leave_modal(state);
+            }
+        }
+        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
+            if let Some(ws) = state.workspaces.get_mut(ws_idx) {
+                ws.set_tag(None);
+                state.mark_session_dirty();
+            }
+            leave_modal(state);
+        }
         (
-            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close" | "Close group"),
         ) => {
             state.selected = ws_idx;
@@ -959,6 +1107,32 @@ pub(super) fn apply_context_menu_action(
                 };
             }
         }
+        (ContextMenuKind::TagHeader { ref tag, .. }, Some("Move group up" | "Move group down")) => {
+            let up = item == Some("Move group up");
+            state.move_tag_group(tag, up);
+            leave_modal(state);
+        }
+        (ContextMenuKind::TagHeader { ref tag, .. }, Some("Collapse" | "Expand")) => {
+            let key = crate::ui::tag_collapse_key(tag);
+            if state.collapsed_space_keys.contains(&key) {
+                state.collapsed_space_keys.remove(&key);
+            } else {
+                state.collapsed_space_keys.insert(key);
+            }
+            state.mark_session_dirty();
+            leave_modal(state);
+        }
+        (ContextMenuKind::TagHeader { ref tag, .. }, Some("Rename tag...")) => {
+            open_rename_tag_by_name(state, tag.clone());
+        }
+        (ContextMenuKind::TagHeader { tag, .. }, Some("Tag color...")) => {
+            let (x, y) = (menu.x, menu.y);
+            open_tag_color_picker(state, tag, x, y);
+        }
+        (ContextMenuKind::TagColor { tag }, Some(accent_label)) => {
+            apply_tag_color(state, &tag, accent_label);
+            leave_modal(state);
+        }
         _ => leave_modal(state),
     }
 }
@@ -1010,6 +1184,34 @@ impl App {
         } else {
             self.state.name_input.trim().to_string()
         };
+
+        if self.state.mode == Mode::RenameWorkspace {
+            if let Some(old_tag) = self.state.tag_rename_from.take() {
+                let new_tag = self.state.name_input.trim().to_string();
+                // A blank rename is a plain cancel: never mass-untag on an empty input.
+                if !new_tag.is_empty() {
+                    for ws in &mut self.state.workspaces {
+                        if ws.tag() == Some(old_tag.as_str()) {
+                            ws.set_tag(Some(new_tag.clone()));
+                        }
+                    }
+                    migrate_tag_keys(&mut self.state, &old_tag, &new_tag);
+                    self.state.mark_session_dirty();
+                }
+                cancel_rename_modal(&mut self.state);
+                return;
+            }
+            if let Some(ws_idx) = self.state.tag_edit_target.take() {
+                let trimmed = self.state.name_input.trim();
+                let tag = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                    ws.set_tag(tag);
+                    self.state.mark_session_dirty();
+                }
+                cancel_rename_modal(&mut self.state);
+                return;
+            }
+        }
 
         match self.state.mode {
             Mode::RenameWorkspace => {
@@ -1232,12 +1434,38 @@ impl App {
                 leave_modal(&mut self.state);
             }
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Rename"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
+                open_tag_workspace(&mut self.state, ws_idx);
+            }
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Rename tag...")) => {
+                open_rename_tag(&mut self.state, ws_idx);
+            }
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag color...")) => {
+                if let Some(tag) = self
+                    .state
+                    .workspaces
+                    .get(ws_idx)
+                    .and_then(|ws| ws.tag().map(str::to_string))
+                {
+                    let (x, y) = (menu.x, menu.y);
+                    open_tag_color_picker(&mut self.state, tag, x, y);
+                } else {
+                    leave_modal(&mut self.state);
+                }
+            }
+            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
+                if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                    ws.set_tag(None);
+                    self.state.mark_session_dirty();
+                }
+                leave_modal(&mut self.state);
+            }
             (
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Close" | "Close group"),
             ) => {
@@ -1338,6 +1566,26 @@ impl App {
                 ContextMenuKind::Pane {
                     ws_idx, pane_id, ..
                 },
+                Some("Paste"),
+            ) => {
+                self.focus_pane_internal_via_api(ws_idx, pane_id);
+                if let Some(text) = smart_clipboard_paste_text() {
+                    if let Some(public_id) = self.public_pane_id(ws_idx, pane_id) {
+                        self.runtime_pane_send_text(
+                            "tui.pane.send_text",
+                            crate::api::schema::PaneSendTextParams {
+                                pane_id: public_id,
+                                text,
+                            },
+                        );
+                    }
+                }
+                self.state.mode = Mode::Terminal;
+            }
+            (
+                ContextMenuKind::Pane {
+                    ws_idx, pane_id, ..
+                },
                 Some("Split right"),
             ) => {
                 self.focus_pane_internal_via_api(ws_idx, pane_id);
@@ -1379,9 +1627,80 @@ impl App {
                     };
                 }
             }
+            (
+                ContextMenuKind::TagHeader { ref tag, .. },
+                Some("Move group up" | "Move group down"),
+            ) => {
+                let up = item == Some("Move group up");
+                self.state.move_tag_group(tag, up);
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::TagHeader { ref tag, .. }, Some("Collapse" | "Expand")) => {
+                let key = crate::ui::tag_collapse_key(tag);
+                if self.state.collapsed_space_keys.contains(&key) {
+                    self.state.collapsed_space_keys.remove(&key);
+                } else {
+                    self.state.collapsed_space_keys.insert(key);
+                }
+                self.state.mark_session_dirty();
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::TagHeader { ref tag, .. }, Some("Rename tag...")) => {
+                open_rename_tag_by_name(&mut self.state, tag.clone());
+            }
+            (ContextMenuKind::TagHeader { tag, .. }, Some("Tag color...")) => {
+                let (x, y) = (menu.x, menu.y);
+                open_tag_color_picker(&mut self.state, tag, x, y);
+            }
+            (ContextMenuKind::TagColor { tag }, Some(accent_label)) => {
+                apply_tag_color(&mut self.state, &tag, accent_label);
+                leave_modal(&mut self.state);
+            }
             _ => leave_modal(&mut self.state),
         }
     }
+}
+
+/// The pane menu's smart Paste: route by clipboard content, richest format first.
+/// Copied files paste as their quoted paths, a snipped image lands in a temp file
+/// and pastes as that file's path (agents read paths), and plain text pastes as
+/// itself. Returns None when the clipboard has nothing usable.
+fn smart_clipboard_paste_text() -> Option<String> {
+    if let Some(paths) = crate::platform::read_clipboard_file_paths() {
+        return Some(quote_paths_for_paste(&paths));
+    }
+    if let Some(image) = crate::platform::read_clipboard_image() {
+        if let Some(path) = save_clipboard_image_for_paste(&image) {
+            return Some(path);
+        }
+    }
+    crate::platform::read_clipboard_text()
+}
+
+fn quote_paths_for_paste(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| {
+            if path.contains(' ') {
+                format!("\"{path}\"")
+            } else {
+                path.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn save_clipboard_image_for_paste(image: &crate::platform::ClipboardImage) -> Option<String> {
+    let dir = std::env::temp_dir().join("herdr-paste");
+    std::fs::create_dir_all(&dir).ok()?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let path = dir.join(format!("paste-{stamp}.{}", image.extension));
+    std::fs::write(&path, &image.bytes).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 fn cancel_rename_modal(state: &mut AppState) {
@@ -1389,6 +1708,8 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = None;
     state.rename_pane_target = None;
+    state.tag_edit_target = None;
+    state.tag_rename_from = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
     leave_modal(state);
@@ -1420,6 +1741,52 @@ mod tests {
 
     fn config_env_lock() -> &'static std::sync::Mutex<()> {
         crate::config::test_config_env_lock()
+    }
+
+    #[test]
+    fn copied_files_paste_as_paths_quoted_only_when_they_need_it() {
+        assert_eq!(
+            super::quote_paths_for_paste(&[
+                "C:\\src\\a.png".to_string(),
+                "C:\\Users\\felip\\my file.txt".to_string()
+            ]),
+            "C:\\src\\a.png \"C:\\Users\\felip\\my file.txt\""
+        );
+    }
+
+    #[test]
+    fn a_clipboard_image_lands_in_a_temp_file_whose_path_is_the_paste() {
+        let image = crate::platform::ClipboardImage {
+            bytes: b"\x89PNG\r\n\x1a\nfake".to_vec(),
+            extension: "png",
+        };
+        let path = super::save_clipboard_image_for_paste(&image).expect("temp save");
+        assert!(path.ends_with(".png"));
+        let written = std::fs::read(&path).expect("written bytes");
+        assert_eq!(written, image.bytes);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_pane_menu_offers_paste_between_swap_and_split() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: crate::layout::PaneId::alloc(),
+                source_pane_id: None,
+                has_manual_label: false,
+                right_click_passthrough: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let items = menu.items();
+        assert!(items.contains(&"Paste"));
+        let paste = items.iter().position(|i| *i == "Paste").unwrap();
+        let split = items.iter().position(|i| *i == "Split right").unwrap();
+        assert!(paste < split);
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -2254,6 +2621,365 @@ mod tests {
                 .pane_state(pane_id)
                 .unwrap()
                 .right_click_passthrough
+        );
+    }
+
+    fn workspace_tag_menu(ws_idx: usize, has_tag: bool) -> ContextMenuState {
+        ContextMenuState {
+            kind: ContextMenuKind::Workspace { ws_idx, has_tag },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        }
+    }
+
+    #[test]
+    fn context_menu_tag_action_sets_workspace_tag_from_input() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        let menu = workspace_tag_menu(0, false);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Tag...")
+            .expect("tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+        assert_eq!(app.state.tag_edit_target, Some(0));
+
+        app.state.name_input = "research".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.state.workspaces[0].tag(), Some("research"));
+        assert_eq!(app.state.tag_edit_target, None);
+    }
+
+    #[test]
+    fn context_menu_tag_action_with_blank_input_clears_tag() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Tag...")
+            .expect("tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "   ".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.state.workspaces[0].tag(), None);
+    }
+
+    #[test]
+    fn context_menu_remove_tag_clears_workspace_tag() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Remove tag")
+            .expect("remove tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert_eq!(app.state.workspaces[0].tag(), None);
+    }
+
+    #[test]
+    fn context_menu_rename_tag_applies_to_every_carrier() {
+        let mut app = app_with_test_workspaces(&["a", "b", "c"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("teaching".into()));
+        app.state.workspaces[2].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        assert_eq!(app.state.mode, Mode::RenameWorkspace);
+        assert_eq!(app.state.tag_rename_from.as_deref(), Some("research"));
+
+        app.state.name_input = "papers".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Every "research" carrier is renamed; the unrelated tag is untouched.
+        assert_eq!(app.state.workspaces[0].tag(), Some("papers"));
+        assert_eq!(app.state.workspaces[1].tag(), Some("teaching"));
+        assert_eq!(app.state.workspaces[2].tag(), Some("papers"));
+        assert_eq!(app.state.tag_rename_from, None);
+    }
+
+    #[test]
+    fn context_menu_rename_tag_migrates_collapse_key() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("research".into()));
+        app.state
+            .collapsed_space_keys
+            .insert(crate::ui::tag_collapse_key("research"));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "papers".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app
+            .state
+            .collapsed_space_keys
+            .contains(&crate::ui::tag_collapse_key("research")));
+        assert!(app
+            .state
+            .collapsed_space_keys
+            .contains(&crate::ui::tag_collapse_key("papers")));
+    }
+
+    #[test]
+    fn context_menu_rename_tag_with_blank_input_is_a_no_op() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "   ".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // Blank input cancels: no mass-untag, both carriers keep the original tag.
+        assert_eq!(app.state.workspaces[0].tag(), Some("research"));
+        assert_eq!(app.state.workspaces[1].tag(), Some("research"));
+        assert_eq!(app.state.tag_rename_from, None);
+    }
+
+    #[test]
+    fn workspace_menu_shows_tag_color_only_when_tagged() {
+        assert!(workspace_tag_menu(0, true)
+            .items()
+            .contains(&"Tag color..."));
+        assert!(!workspace_tag_menu(0, false)
+            .items()
+            .contains(&"Tag color..."));
+    }
+
+    #[test]
+    fn context_menu_tag_color_action_opens_the_accent_picker() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Tag color...")
+            .expect("tag color item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert!(matches!(
+            app.state.context_menu.as_ref().map(|menu| &menu.kind),
+            Some(ContextMenuKind::TagColor { tag }) if tag == "research"
+        ));
+    }
+
+    #[test]
+    fn tag_color_picker_items_are_every_accent_label() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TagColor {
+                tag: "research".into(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let items = menu.items();
+        let expected: Vec<&str> = crate::ui::TagAccent::ALL
+            .iter()
+            .map(|accent| accent.label())
+            .collect();
+        assert_eq!(items, expected);
+        // Red is never offered as a tag color.
+        assert!(!items.contains(&"Red"));
+    }
+
+    #[test]
+    fn picking_an_accent_persists_the_tag_color() {
+        let mut app = app_with_test_workspaces(&["main"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TagColor {
+                tag: "research".into(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == crate::ui::TagAccent::Mauve.label())
+            .expect("mauve item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert_eq!(
+            app.state.tag_colors.get("research").map(String::as_str),
+            Some(crate::ui::TagAccent::Mauve.id())
+        );
+    }
+
+    #[test]
+    fn context_menu_rename_tag_migrates_color_and_manual_order() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("teaching".into()));
+        app.state
+            .tag_colors
+            .insert("research".into(), crate::ui::TagAccent::Teal.id().into());
+        app.state.tag_order = vec!["teaching".into(), "research".into()];
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "papers".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The color override follows the new name; the old key is gone.
+        assert_eq!(
+            app.state.tag_colors.get("papers").map(String::as_str),
+            Some(crate::ui::TagAccent::Teal.id())
+        );
+        assert!(!app.state.tag_colors.contains_key("research"));
+        // The manual order slot is renamed in place, preserving position.
+        assert_eq!(
+            app.state.tag_order,
+            vec!["teaching".to_string(), "papers".to_string()]
+        );
+    }
+
+    #[test]
+    fn renaming_a_tag_onto_an_existing_one_keeps_the_survivor_color_and_dedupes_order() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("papers".into()));
+        app.state
+            .tag_colors
+            .insert("research".into(), crate::ui::TagAccent::Teal.id().into());
+        app.state
+            .tag_colors
+            .insert("papers".into(), crate::ui::TagAccent::Green.id().into());
+        app.state.tag_order = vec!["papers".into(), "research".into()];
+        let menu = workspace_tag_menu(0, true);
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .expect("rename tag item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+        app.state.name_input = "papers".into();
+        app.handle_rename_key_via_api(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The surviving "papers" keeps its own green; research's teal is dropped.
+        assert_eq!(
+            app.state.tag_colors.get("papers").map(String::as_str),
+            Some(crate::ui::TagAccent::Green.id())
+        );
+        assert!(!app.state.tag_colors.contains_key("research"));
+        // The order dedupes to a single "papers" entry.
+        assert_eq!(app.state.tag_order, vec!["papers".to_string()]);
+    }
+
+    #[test]
+    fn tag_header_menu_items_by_label_at_the_edges() {
+        // A lone group is both first and last: no move items, expand/rename/color.
+        let only = ContextMenuState {
+            kind: ContextMenuKind::TagHeader {
+                tag: "research".into(),
+                collapsed: false,
+                is_first: true,
+                is_last: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let items = only.items();
+        assert!(!items.contains(&"Move group up"));
+        assert!(!items.contains(&"Move group down"));
+        assert!(items.contains(&"Collapse"));
+        assert!(items.contains(&"Rename tag..."));
+        assert!(items.contains(&"Tag color..."));
+
+        // A middle group offers both moves and shows Expand when collapsed.
+        let middle = ContextMenuState {
+            kind: ContextMenuKind::TagHeader {
+                tag: "research".into(),
+                collapsed: true,
+                is_first: false,
+                is_last: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let items = middle.items();
+        assert!(items.contains(&"Move group up"));
+        assert!(items.contains(&"Move group down"));
+        assert!(items.contains(&"Expand"));
+    }
+
+    #[test]
+    fn tag_header_move_group_reorders_and_flips_sort_to_manual() {
+        let mut app = app_with_test_workspaces(&["a", "b"]);
+        app.state.workspaces[0].set_tag(Some("research".into()));
+        app.state.workspaces[1].set_tag(Some("teaching".into()));
+        app.state.sidebar_spaces.tag_sort = crate::config::TagSortMode::FirstAppearance;
+        // research appears first; move teaching (the last group) up.
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::TagHeader {
+                tag: "teaching".into(),
+                collapsed: false,
+                is_first: false,
+                is_last: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Move group up")
+            .expect("move up item");
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert_eq!(
+            app.state.sidebar_spaces.tag_sort,
+            crate::config::TagSortMode::Manual
+        );
+        assert_eq!(
+            crate::ui::ordered_tag_names(&app.state),
+            vec!["teaching".to_string(), "research".to_string()]
         );
     }
 

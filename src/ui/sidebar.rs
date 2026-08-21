@@ -35,6 +35,7 @@ pub(crate) struct AgentPanelEntry {
     pub state: AgentState,
     pub seen: bool,
     pub last_agent_state_change_seq: Option<u64>,
+    pub last_agent_state_change_at: Option<std::time::Instant>,
     pub state_labels: std::collections::HashMap<String, String>,
     pub tokens: std::collections::HashMap<String, String>,
 }
@@ -175,6 +176,7 @@ fn collect_agent_panel_entries_with_runtimes(
                         state: detail.state,
                         seen: detail.seen,
                         last_agent_state_change_seq: detail.last_agent_state_change_seq,
+                        last_agent_state_change_at: detail.last_agent_state_change_at,
                         state_labels: detail.state_labels,
                         tokens: detail.tokens,
                     }
@@ -191,6 +193,22 @@ pub(super) fn agent_panel_status_key(state: AgentState, seen: bool) -> &'static 
         (AgentState::Blocked, _) => "blocked",
         (AgentState::Unknown, _) => "unknown",
     }
+}
+
+/// (total known agents in a space, how many need attention). A pane counts as an
+/// agent when it resolves to a known agent kind; it needs attention when it is
+/// blocked or finished-and-unseen (the same rule the agent panel uses). Drives the
+/// `agents` space token's "N agents · M need you" summary.
+fn workspace_agent_summary(app: &AppState, ws: &crate::workspace::Workspace) -> (usize, usize) {
+    ws.pane_details(&app.terminals)
+        .iter()
+        .filter(|detail| detail.agent.is_some())
+        .fold((0usize, 0usize), |(total, needs_you), detail| {
+            (
+                total + 1,
+                needs_you + usize::from(tokens::needs_attention(detail.state, detail.seen)),
+            )
+        })
 }
 
 fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indented: bool) -> u16 {
@@ -214,6 +232,7 @@ fn workspace_row_height(app: &AppState, ws: &crate::workspace::Workspace, indent
             ahead_behind: ws.git_ahead_behind(),
             tokens: &token_values,
             suppress_git_details: indented,
+            agents: workspace_agent_summary(app, ws),
         },
     )
     .len()
@@ -228,14 +247,6 @@ fn workspace_row_height_in_body(
     body_height: u16,
 ) -> u16 {
     workspace_row_height(app, workspace, indented).min(body_height)
-}
-
-fn workspace_entry_gap(app: &AppState, entries: &[WorkspaceListEntry], entry_idx: usize) -> u16 {
-    if entry_idx + 1 < entries.len() && !next_entry_is_indented_workspace(entries, entry_idx) {
-        app.sidebar_spaces.row_gap
-    } else {
-        0
-    }
 }
 
 fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
@@ -301,6 +312,148 @@ pub(crate) fn grouped_child_display_label(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
     Workspace { ws_idx: usize, indented: bool },
+}
+
+/// Collapse key for a spaces tag group. Kept distinct from worktree-space keys,
+/// which use their raw repo key, so the two grouping mechanisms never collide.
+pub(crate) fn tag_collapse_key(tag: &str) -> String {
+    format!("tag:{tag}")
+}
+
+/// Collapse key for an agents-panel tag group. Kept distinct from the spaces
+/// `tag:<name>` key so a tag can be collapsed in one panel and open in the other.
+pub(crate) fn agent_tag_collapse_key(tag: &str) -> String {
+    format!("agent-tag:{tag}")
+}
+
+/// Rolled-up attention level for a group of workspaces, most-urgent first. Used
+/// to color the leading edge of a tag group header from its members' states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NeedLevel {
+    /// A member is blocked and needs a human.
+    Blocked,
+    /// A member finished and has not been seen yet (idle + unseen).
+    NeedsYou,
+    /// A member is actively working.
+    Working,
+    /// A member is idle and already seen — nothing pending, but present.
+    Idle,
+}
+
+fn need_level_priority(need: NeedLevel) -> u8 {
+    match need {
+        NeedLevel::Blocked => 3,
+        NeedLevel::NeedsYou => 2,
+        NeedLevel::Working => 1,
+        NeedLevel::Idle => 0,
+    }
+}
+
+/// Reduce each member's `(state, seen)` to the strongest attention level across
+/// the group, ordered Blocked > NeedsYou > Working > Idle. An empty slice, or a
+/// group whose members are all Unknown, yields `None` (no edge to draw).
+pub(crate) fn need_rollup(states: &[(AgentState, bool)]) -> Option<NeedLevel> {
+    states
+        .iter()
+        .filter_map(|(state, seen)| match (state, seen) {
+            (AgentState::Blocked, _) => Some(NeedLevel::Blocked),
+            (AgentState::Idle, false) => Some(NeedLevel::NeedsYou),
+            (AgentState::Working, _) => Some(NeedLevel::Working),
+            (AgentState::Idle, true) => Some(NeedLevel::Idle),
+            (AgentState::Unknown, _) => None,
+        })
+        .max_by_key(|need| need_level_priority(*need))
+}
+
+/// One ordered tag group: the tag name and the top-level entry indices that
+/// belong to it, in their original list order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TagGroup {
+    pub tag: String,
+    pub member_entry_indices: Vec<usize>,
+}
+
+/// Grouping of a top-level entry list by tag. `groups` are in first-appearance
+/// tag order; `ungrouped` are the remaining top-level entry indices in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TagGrouping {
+    pub groups: Vec<TagGroup>,
+    pub ungrouped: Vec<usize>,
+}
+
+/// Pure grouping core: given each top-level entry's optional tag (in list order),
+/// return the tag groups in first-appearance order plus the untagged remainder.
+/// A tag with a single member still forms a group so its header is always shown.
+pub(crate) fn group_entries_by_tag(entry_tags: &[Option<String>]) -> TagGrouping {
+    let mut order: Vec<String> = Vec::new();
+    let mut members: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut ungrouped: Vec<usize> = Vec::new();
+
+    for (idx, tag) in entry_tags.iter().enumerate() {
+        match tag {
+            Some(tag) if !tag.is_empty() => {
+                if !members.contains_key(tag) {
+                    order.push(tag.clone());
+                }
+                members.entry(tag.clone()).or_default().push(idx);
+            }
+            _ => ungrouped.push(idx),
+        }
+    }
+
+    let groups = order
+        .into_iter()
+        .map(|tag| {
+            let member_entry_indices = members.remove(&tag).unwrap_or_default();
+            TagGroup {
+                tag,
+                member_entry_indices,
+            }
+        })
+        .collect();
+
+    TagGrouping { groups, ungrouped }
+}
+
+/// Reorder tag groups in place per the sort mode. `Manual` follows `manual_order`
+/// (tags absent from it keep their first-appearance order, appended after the
+/// listed ones); `Name` sorts case-insensitively by tag name; `FirstAppearance`
+/// leaves the input order untouched. Sorting is stable, so ties (and unknown
+/// tags under `Manual`) preserve first-appearance order.
+pub(crate) fn sort_tag_groups(
+    groups: &mut [TagGroup],
+    mode: crate::config::TagSortMode,
+    manual_order: &[String],
+) {
+    match mode {
+        crate::config::TagSortMode::FirstAppearance => {}
+        crate::config::TagSortMode::Name => {
+            groups.sort_by_key(|group| group.tag.to_lowercase());
+        }
+        crate::config::TagSortMode::Manual => {
+            let rank = |tag: &str| {
+                manual_order
+                    .iter()
+                    .position(|listed| listed == tag)
+                    .unwrap_or(usize::MAX)
+            };
+            groups.sort_by_key(|group| rank(&group.tag));
+        }
+    }
+}
+
+/// The tag-group names in the spaces list's display order, respecting the active
+/// sort mode and manual order. Drives header-menu "is first / is last" and the
+/// move-up/down reorder. Empty when no workspace carries a tag.
+pub(crate) fn ordered_tag_names(app: &AppState) -> Vec<String> {
+    tag_layout_rows(app)
+        .into_iter()
+        .filter_map(|row| match row {
+            TagLayoutRow::Header { tag, .. } => Some(tag),
+            TagLayoutRow::Entry { .. } => None,
+        })
+        .collect()
 }
 
 pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
@@ -435,6 +588,202 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     entries
 }
 
+/// A desktop sidebar row: either a tag group header or a workspace entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TagLayoutRow {
+    Header {
+        tag: String,
+        count: usize,
+        collapsed: bool,
+        /// First workspace of the group; the header card keys off it so the tag
+        /// name stays resolvable even when the group is collapsed.
+        first_ws_idx: usize,
+    },
+    Entry {
+        entry: WorkspaceListEntry,
+        /// True when this entry belongs under a tag group header, so its card
+        /// indents two cells beneath the header. Untagged rows stay at column 0.
+        grouped: bool,
+    },
+}
+
+/// Split a worktree-grouped entry list into top-level blocks, where each block is
+/// a top-level entry followed by its indented worktree children.
+fn top_level_blocks(entries: &[WorkspaceListEntry]) -> Vec<Vec<WorkspaceListEntry>> {
+    let mut blocks: Vec<Vec<WorkspaceListEntry>> = Vec::new();
+    for entry in entries {
+        match entry {
+            WorkspaceListEntry::Workspace {
+                indented: false, ..
+            } => blocks.push(vec![entry.clone()]),
+            WorkspaceListEntry::Workspace { indented: true, .. } => {
+                if let Some(last) = blocks.last_mut() {
+                    last.push(entry.clone());
+                } else {
+                    blocks.push(vec![entry.clone()]);
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// Desktop layout: group the top-level workspace blocks by tag, ordering tagged
+/// groups first (in first-appearance order) with a header before each, and the
+/// untagged blocks after. A collapsed tag group hides its member rows but keeps
+/// its header. Worktree grouping inside a block is preserved untouched.
+pub(crate) fn tag_layout_rows(app: &AppState) -> Vec<TagLayoutRow> {
+    let entries = workspace_list_entries(app);
+    let blocks = top_level_blocks(&entries);
+
+    let block_tags: Vec<Option<String>> = blocks
+        .iter()
+        .map(|block| {
+            block.first().and_then(|entry| {
+                let WorkspaceListEntry::Workspace { ws_idx, .. } = entry;
+                app.workspaces
+                    .get(*ws_idx)
+                    .and_then(|ws| ws.tag().map(str::to_string))
+            })
+        })
+        .collect();
+
+    let mut grouping = group_entries_by_tag(&block_tags);
+    sort_tag_groups(
+        &mut grouping.groups,
+        app.sidebar_spaces.tag_sort,
+        &app.tag_order,
+    );
+    let mut rows = Vec::new();
+
+    for group in &grouping.groups {
+        let collapsed = app
+            .collapsed_space_keys
+            .contains(&tag_collapse_key(&group.tag));
+        let first_ws_idx = group
+            .member_entry_indices
+            .first()
+            .and_then(|block_idx| blocks[*block_idx].first())
+            .map(|entry| {
+                let WorkspaceListEntry::Workspace { ws_idx, .. } = entry;
+                *ws_idx
+            })
+            .unwrap_or(0);
+        rows.push(TagLayoutRow::Header {
+            tag: group.tag.clone(),
+            count: group.member_entry_indices.len(),
+            collapsed,
+            first_ws_idx,
+        });
+        if collapsed {
+            continue;
+        }
+        for block_idx in &group.member_entry_indices {
+            for entry in &blocks[*block_idx] {
+                rows.push(TagLayoutRow::Entry {
+                    entry: entry.clone(),
+                    grouped: true,
+                });
+            }
+        }
+    }
+
+    for block_idx in &grouping.ungrouped {
+        for entry in &blocks[*block_idx] {
+            rows.push(TagLayoutRow::Entry {
+                entry: entry.clone(),
+                grouped: false,
+            });
+        }
+    }
+
+    rows
+}
+
+/// True when any workspace carries a tag, so the sidebar should group by tag.
+pub(crate) fn has_tag_groups(app: &AppState) -> bool {
+    app.workspaces.iter().any(|ws| ws.tag().is_some())
+}
+
+/// Workspace indices in the order the desktop sidebar draws them, tag headers
+/// excluded and collapsed-group members omitted. Drives up/down navigation.
+pub(crate) fn workspace_display_order(app: &AppState) -> Vec<usize> {
+    workspace_display_rows(app)
+        .into_iter()
+        .filter_map(|row| match row {
+            TagLayoutRow::Entry {
+                entry: WorkspaceListEntry::Workspace { ws_idx, .. },
+                ..
+            } => Some(ws_idx),
+            TagLayoutRow::Header { .. } => None,
+        })
+        .collect()
+}
+
+/// Display-row index of a top-level or child workspace, or `None` when it is
+/// hidden inside a collapsed group. `app.workspace_scroll` indexes this list.
+pub(crate) fn workspace_display_row_index(app: &AppState, ws_idx: usize) -> Option<usize> {
+    workspace_display_rows(app).iter().position(|row| {
+        matches!(
+            row,
+            TagLayoutRow::Entry {
+                entry: WorkspaceListEntry::Workspace { ws_idx: entry_idx, .. },
+                ..
+            } if *entry_idx == ws_idx
+        )
+    })
+}
+
+/// The ordered rows the desktop workspace list draws: tag headers interleaved
+/// with workspace entries when any workspace is tagged, or the plain worktree
+/// entry list otherwise. `app.workspace_scroll` indexes into this list.
+fn workspace_display_rows(app: &AppState) -> Vec<TagLayoutRow> {
+    if has_tag_groups(app) {
+        tag_layout_rows(app)
+    } else {
+        workspace_list_entries(app)
+            .into_iter()
+            .map(|entry| TagLayoutRow::Entry {
+                entry,
+                grouped: false,
+            })
+            .collect()
+    }
+}
+
+/// Height of a single display row within the body, headers being one row tall.
+fn display_row_height(app: &AppState, row: &TagLayoutRow, body_height: u16) -> u16 {
+    match row {
+        TagLayoutRow::Header { .. } => 1u16.min(body_height),
+        TagLayoutRow::Entry {
+            entry: WorkspaceListEntry::Workspace { ws_idx, indented },
+            ..
+        } => app
+            .workspaces
+            .get(*ws_idx)
+            .map(|ws| workspace_row_height_in_body(app, ws, *indented, body_height))
+            .unwrap_or(0),
+    }
+}
+
+/// Row gap after a display row. Headers and the row before an indented child sit
+/// flush; every other row carries the configured spaces gap.
+fn display_row_gap(app: &AppState, rows: &[TagLayoutRow], idx: usize) -> u16 {
+    let next_is_indented_child = matches!(
+        rows.get(idx.saturating_add(1)),
+        Some(TagLayoutRow::Entry {
+            entry: WorkspaceListEntry::Workspace { indented: true, .. },
+            ..
+        })
+    );
+    let is_header = matches!(rows.get(idx), Some(TagLayoutRow::Header { .. }));
+    if idx + 1 < rows.len() && !next_is_indented_child && !is_header {
+        app.sidebar_spaces.row_gap
+    } else {
+        0
+    }
+}
+
 pub(crate) fn workspace_list_rect(area: Rect, split_ratio: f32) -> Rect {
     let (ws_area, _) = expanded_sidebar_sections(area, split_ratio);
     ws_area
@@ -460,19 +809,10 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
 
     let mut used_rows = 0u16;
     let mut visible = 0usize;
-    let entries = workspace_list_entries(app);
-    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let (row_height, gap) = match entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                let Some(ws) = app.workspaces.get(*ws_idx) else {
-                    continue;
-                };
-                (
-                    workspace_row_height_in_body(app, ws, *indented, body.height),
-                    workspace_entry_gap(app, &entries, entry_idx),
-                )
-            }
-        };
+    let rows = workspace_display_rows(app);
+    for (row_idx, row) in rows.iter().enumerate().skip(scroll) {
+        let row_height = display_row_height(app, row, body.height);
+        let gap = display_row_gap(app, &rows, row_idx);
         if used_rows.saturating_add(row_height) > body.height {
             break;
         }
@@ -485,24 +825,19 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
 
 fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
     let body = workspace_list_body_rect(area, false);
-    let entries = workspace_list_entries(app);
+    let rows = workspace_display_rows(app);
     let mut used_rows = 0u16;
-    let mut start = entries.len();
-    for (entry_idx, entry) in entries.iter().enumerate().rev() {
-        let WorkspaceListEntry::Workspace { ws_idx, indented } = entry;
-        let Some(workspace) = app.workspaces.get(*ws_idx) else {
-            continue;
-        };
-        let gap = workspace_entry_gap(app, &entries, entry_idx);
-        let needed = workspace_row_height_in_body(app, workspace, *indented, body.height)
-            .saturating_add(gap);
+    let mut start = rows.len();
+    for (row_idx, row) in rows.iter().enumerate().rev() {
+        let gap = display_row_gap(app, &rows, row_idx);
+        let needed = display_row_height(app, row, body.height).saturating_add(gap);
         if used_rows.saturating_add(needed) > body.height {
             break;
         }
         used_rows = used_rows.saturating_add(needed);
-        start = entry_idx;
+        start = row_idx;
     }
-    start.min(entries.len().saturating_sub(1))
+    start.min(rows.len().saturating_sub(1))
 }
 
 pub(crate) fn workspace_list_scroll_metrics(
@@ -563,8 +898,136 @@ pub(crate) fn agent_entry_height_in_body(
         .min(body_height)
 }
 
-pub(crate) fn agent_entry_gap(app: &AppState, entry_idx: usize, entry_count: usize) -> u16 {
-    if entry_idx + 1 < entry_count {
+/// A display row in the agents panel: either a tag group header or an agent
+/// entry. Entries carry the index into [`agent_panel_entries`] so hit-testing
+/// resolves back to the same `AgentPanelEntry` the panel drew.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentPanelRow {
+    Header {
+        tag: String,
+        count: usize,
+        collapsed: bool,
+        /// Rolled-up attention across the group's member agents, most-urgent
+        /// first, driving the header's leading edge exactly as the spaces
+        /// headers color theirs.
+        need: Option<NeedLevel>,
+    },
+    Entry {
+        /// Index into [`agent_panel_entries`].
+        entry_idx: usize,
+    },
+}
+
+/// True when any agent-panel entry inherits a tag from its workspace, so the
+/// panel should group its rows under tag headers.
+pub(crate) fn has_agent_tag_groups(app: &AppState, entries: &[AgentPanelEntry]) -> bool {
+    entries.iter().any(|entry| {
+        app.workspaces
+            .get(entry.ws_idx)
+            .and_then(|ws| ws.tag())
+            .is_some()
+    })
+}
+
+/// Group the agent-panel entries by their inherited workspace tag, interleaving
+/// a one-row header before each group (first-appearance tag order) with the
+/// untagged entries listed after, mirroring the spaces list. An agent is never
+/// tagged directly: it inherits its workspace's tag. When no entry carries a
+/// tag, this is the plain entry list with no headers.
+pub(crate) fn agent_panel_display_rows(
+    app: &AppState,
+    entries: &[AgentPanelEntry],
+) -> Vec<AgentPanelRow> {
+    if !has_agent_tag_groups(app, entries) {
+        return (0..entries.len())
+            .map(|entry_idx| AgentPanelRow::Entry { entry_idx })
+            .collect();
+    }
+
+    let entry_tags: Vec<Option<String>> = entries
+        .iter()
+        .map(|entry| {
+            app.workspaces
+                .get(entry.ws_idx)
+                .and_then(|ws| ws.tag().map(str::to_string))
+        })
+        .collect();
+    let mut grouping = group_entries_by_tag(&entry_tags);
+    sort_tag_groups(
+        &mut grouping.groups,
+        app.sidebar_spaces.tag_sort,
+        &app.tag_order,
+    );
+
+    let mut rows = Vec::new();
+    for group in &grouping.groups {
+        let collapsed = app
+            .collapsed_space_keys
+            .contains(&agent_tag_collapse_key(&group.tag));
+        let member_states: Vec<(AgentState, bool)> = group
+            .member_entry_indices
+            .iter()
+            .filter_map(|entry_idx| entries.get(*entry_idx))
+            .map(|entry| (entry.state, entry.seen))
+            .collect();
+        rows.push(AgentPanelRow::Header {
+            tag: group.tag.clone(),
+            count: group.member_entry_indices.len(),
+            collapsed,
+            need: need_rollup(&member_states),
+        });
+        if collapsed {
+            continue;
+        }
+        for entry_idx in &group.member_entry_indices {
+            rows.push(AgentPanelRow::Entry {
+                entry_idx: *entry_idx,
+            });
+        }
+    }
+    for entry_idx in &grouping.ungrouped {
+        rows.push(AgentPanelRow::Entry {
+            entry_idx: *entry_idx,
+        });
+    }
+
+    rows
+}
+
+/// Display-row index of the entry at `entry_idx`, mapping an `agent_panel_entries`
+/// index through the interleaved header rows so scroll math (which indexes the
+/// display list) can target the right visible row. `None` when the entry is
+/// hidden inside a collapsed group or out of range.
+pub(crate) fn agent_panel_display_row_for_entry(
+    rows: &[AgentPanelRow],
+    entry_idx: usize,
+) -> Option<usize> {
+    rows.iter()
+        .position(|row| matches!(row, AgentPanelRow::Entry { entry_idx: e } if *e == entry_idx))
+}
+
+/// Height of one agent-panel display row within the body: a header is one row
+/// tall, an entry is its rendered agent-rows height.
+pub(crate) fn agent_display_row_height(
+    app: &AppState,
+    entries: &[AgentPanelEntry],
+    row: &AgentPanelRow,
+    body_height: u16,
+) -> u16 {
+    match row {
+        AgentPanelRow::Header { .. } => 1u16.min(body_height),
+        AgentPanelRow::Entry { entry_idx } => entries
+            .get(*entry_idx)
+            .map(|entry| agent_entry_height_in_body(app, entry, body_height))
+            .unwrap_or(0),
+    }
+}
+
+/// Row gap after an agent-panel display row. Headers sit flush against the row
+/// below them; every other row but the last carries the configured agents gap.
+pub(crate) fn agent_display_row_gap(app: &AppState, rows: &[AgentPanelRow], idx: usize) -> u16 {
+    let is_header = matches!(rows.get(idx), Some(AgentPanelRow::Header { .. }));
+    if idx + 1 < rows.len() && !is_header {
         app.sidebar_agents.row_gap
     } else {
         0
@@ -580,15 +1043,16 @@ fn agent_panel_visible_count_from(app: &AppState, area: Rect, scroll: usize) -> 
     let mut used_rows = 0u16;
     let mut visible = 0usize;
     let entries = agent_panel_entries(app);
-    for (index, entry) in entries.iter().enumerate().skip(scroll) {
-        let height = agent_entry_height_in_body(app, entry, body.height);
+    let rows = agent_panel_display_rows(app, &entries);
+    for (index, row) in rows.iter().enumerate().skip(scroll) {
+        let height = agent_display_row_height(app, &entries, row, body.height);
         if used_rows.saturating_add(height) > body.height {
             break;
         }
         used_rows = used_rows.saturating_add(height);
         visible += 1;
         used_rows = used_rows
-            .saturating_add(agent_entry_gap(app, index, entries.len()))
+            .saturating_add(agent_display_row_gap(app, &rows, index))
             .min(body.height);
     }
     visible
@@ -597,18 +1061,19 @@ fn agent_panel_visible_count_from(app: &AppState, area: Rect, scroll: usize) -> 
 fn agent_panel_bottom_start(app: &AppState, area: Rect) -> usize {
     let body = agent_panel_body_rect(area, false);
     let entries = agent_panel_entries(app);
+    let rows = agent_panel_display_rows(app, &entries);
     let mut used_rows = 0u16;
-    let mut start = entries.len();
-    for (index, entry) in entries.iter().enumerate().rev() {
-        let gap = agent_entry_gap(app, index, entries.len());
-        let needed = agent_entry_height_in_body(app, entry, body.height).saturating_add(gap);
+    let mut start = rows.len();
+    for (index, row) in rows.iter().enumerate().rev() {
+        let gap = agent_display_row_gap(app, &rows, index);
+        let needed = agent_display_row_height(app, &entries, row, body.height).saturating_add(gap);
         if used_rows.saturating_add(needed) > body.height {
             break;
         }
         used_rows = used_rows.saturating_add(needed);
         start = index;
     }
-    start.min(entries.len().saturating_sub(1))
+    start.min(rows.len().saturating_sub(1))
 }
 
 pub(crate) fn agent_panel_scroll_for_target(
@@ -676,29 +1141,42 @@ pub(crate) fn compute_workspace_list_areas(
     let mut cards = Vec::new();
     let headers = Vec::new();
 
-    let entries = workspace_list_entries(app);
-    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        match entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                let Some(ws) = app.workspaces.get(*ws_idx) else {
+    let rows = workspace_display_rows(app);
+    for (row_idx, row) in rows.iter().enumerate().skip(scroll) {
+        let (ws_idx, indented, is_tag_header, grouped) = match row {
+            TagLayoutRow::Header { first_ws_idx, .. } => (*first_ws_idx, false, true, false),
+            TagLayoutRow::Entry {
+                entry: WorkspaceListEntry::Workspace { ws_idx, indented },
+                grouped,
+            } => {
+                if app.workspaces.get(*ws_idx).is_none() {
                     continue;
-                };
-                let row_height = workspace_row_height_in_body(app, ws, *indented, body.height);
-                let gap = workspace_entry_gap(app, &entries, entry_idx);
-                if row_y.saturating_add(row_height) > body_bottom {
-                    break;
                 }
-                cards.push(crate::app::state::WorkspaceCardArea {
-                    ws_idx: *ws_idx,
-                    rect: Rect::new(body.x, row_y, body.width, row_height),
-                    indented: *indented,
-                });
-                row_y = row_y
-                    .saturating_add(row_height)
-                    .saturating_add(gap)
-                    .min(body_bottom);
+                (*ws_idx, *indented, false, *grouped)
             }
+        };
+        let row_height = display_row_height(app, row, body.height);
+        let gap = display_row_gap(app, &rows, row_idx);
+        if row_y.saturating_add(row_height) > body_bottom {
+            break;
         }
+        // A tag-group member card indents two cells under its header; everything
+        // drawn inside the card (state icon, name, rollup edge) rides the shift.
+        let (card_x, card_width) = if grouped {
+            (body.x.saturating_add(2), body.width.saturating_sub(2))
+        } else {
+            (body.x, body.width)
+        };
+        cards.push(crate::app::state::WorkspaceCardArea {
+            ws_idx,
+            rect: Rect::new(card_x, row_y, card_width, row_height),
+            indented,
+            is_tag_header,
+        });
+        row_y = row_y
+            .saturating_add(row_height)
+            .saturating_add(gap)
+            .min(body_bottom);
     }
 
     (cards, headers)
@@ -918,7 +1396,7 @@ pub(crate) fn workspace_drop_slots(
 
     let mut slots = Vec::new();
     let mut previous_root = None;
-    for card in cards {
+    for card in cards.iter().filter(|card| !card.is_tag_header) {
         let Some(entry_idx) = entry_position(card.ws_idx) else {
             continue;
         };
@@ -937,7 +1415,7 @@ pub(crate) fn workspace_drop_slots(
         }
     }
 
-    let Some(last) = cards.last() else {
+    let Some(last) = cards.iter().rev().find(|card| !card.is_tag_header) else {
         return slots;
     };
     let Some(last_entry_idx) = entry_position(last.ws_idx) else {
@@ -1023,6 +1501,7 @@ fn resolved_token_spans(
         .iter()
         .map(|token| match &token.kind {
             ResolvedTokenKind::StateIcon => display_width(state_icon.0),
+            ResolvedTokenKind::NeedEdge { .. } => 1,
             ResolvedTokenKind::GitStatus { ahead, behind } => {
                 usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
                     + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
@@ -1041,6 +1520,8 @@ fn resolved_token_spans(
             | ResolvedTokenKind::Agent(text)
             | ResolvedTokenKind::TerminalTitle(text)
             | ResolvedTokenKind::Branch(text)
+            | ResolvedTokenKind::SpaceAgents(text)
+            | ResolvedTokenKind::Waiting { text, .. }
             | ResolvedTokenKind::Custom(text) => display_width(text),
             _ => 0,
         })
@@ -1174,7 +1655,36 @@ fn resolved_token_spans(
                     ));
                 }
             }
-            ResolvedTokenKind::TerminalTitle(text) | ResolvedTokenKind::Custom(text) => {
+            ResolvedTokenKind::NeedEdge { state, seen } => {
+                let (symbol, color) = match (state, seen) {
+                    (AgentState::Blocked, _) => ("▎", Some(p.red)),
+                    (AgentState::Idle, false) => ("▎", Some(p.green)),
+                    (AgentState::Idle, true) => ("▎", Some(p.yellow)),
+                    (AgentState::Working | AgentState::Unknown, _) => (" ", None),
+                };
+                let style = color.map_or_else(Style::default, |color| Style::default().fg(color));
+                spans.push(Span::styled(
+                    symbol.to_string(),
+                    apply_token_style(style, token.style),
+                ));
+            }
+            ResolvedTokenKind::Waiting { text, state } => {
+                let color = if *state == AgentState::Blocked {
+                    p.red
+                } else {
+                    p.green
+                };
+                spans.push(Span::styled(
+                    truncate_end(text, budgets[index]),
+                    apply_token_style(
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        token.style,
+                    ),
+                ));
+            }
+            ResolvedTokenKind::TerminalTitle(text)
+            | ResolvedTokenKind::SpaceAgents(text)
+            | ResolvedTokenKind::Custom(text) => {
                 spans.push(Span::styled(
                     truncate_end(text, budgets[index]),
                     apply_token_style(custom_style, token.style),
@@ -1204,6 +1714,171 @@ fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) 
         };
     }
     style
+}
+
+/// A theme-accent choice a tag can be painted with. `red` is deliberately absent:
+/// red is reserved for broken/blocked state, so no tag ever borrows it. The `id()`
+/// is the stable string persisted per tag name in the session snapshot; `label()`
+/// is what the picker shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagAccent {
+    Accent,
+    Teal,
+    Green,
+    Yellow,
+    Mauve,
+}
+
+impl TagAccent {
+    /// The accents the picker offers, in menu order.
+    pub(crate) const ALL: [TagAccent; 5] = [
+        TagAccent::Accent,
+        TagAccent::Teal,
+        TagAccent::Green,
+        TagAccent::Yellow,
+        TagAccent::Mauve,
+    ];
+
+    /// Stable id persisted in the snapshot's `tag_colors` map.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            TagAccent::Accent => "accent",
+            TagAccent::Teal => "teal",
+            TagAccent::Green => "green",
+            TagAccent::Yellow => "yellow",
+            TagAccent::Mauve => "mauve",
+        }
+    }
+
+    /// Human name shown beside the swatch in the picker.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TagAccent::Accent => "Accent",
+            TagAccent::Teal => "Teal",
+            TagAccent::Green => "Green",
+            TagAccent::Yellow => "Yellow",
+            TagAccent::Mauve => "Mauve",
+        }
+    }
+
+    /// Parse a persisted id back into an accent, ignoring unknown ids so a stale
+    /// or hand-edited snapshot falls back to the stable-hash default.
+    pub(crate) fn from_id(id: &str) -> Option<TagAccent> {
+        TagAccent::ALL.into_iter().find(|accent| accent.id() == id)
+    }
+
+    /// Resolve the accent to a concrete color from the active palette.
+    pub(crate) fn color(self, p: &Palette) -> Color {
+        match self {
+            TagAccent::Accent => p.accent,
+            TagAccent::Teal => p.teal,
+            TagAccent::Green => p.green,
+            TagAccent::Yellow => p.yellow,
+            TagAccent::Mauve => p.mauve,
+        }
+    }
+}
+
+/// Stable default accent for a tag, hashed from its bytes onto the picker's set.
+/// Used when the tag has no explicit color override.
+pub(crate) fn default_tag_accent(tag: &str) -> TagAccent {
+    let hash = tag.bytes().fold(0u32, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as u32)
+    });
+    // Only the first four accents form the hash default, matching the historical
+    // palette; `mauve` is reachable solely through an explicit pick.
+    let hashed = [
+        TagAccent::Accent,
+        TagAccent::Teal,
+        TagAccent::Green,
+        TagAccent::Yellow,
+    ];
+    hashed[(hash as usize) % hashed.len()]
+}
+
+/// Color for a tag: the explicit per-tag-name override in `overrides` when one is
+/// set (and parses to a known accent), otherwise the stable-hash default. `p.red`
+/// is never returned. The same tag always maps to the same color absent an override.
+pub(crate) fn tag_color_with_overrides(
+    tag: &str,
+    overrides: &std::collections::HashMap<String, String>,
+    p: &Palette,
+) -> Color {
+    overrides
+        .get(tag)
+        .and_then(|id| TagAccent::from_id(id))
+        .unwrap_or_else(|| default_tag_accent(tag))
+        .color(p)
+}
+
+/// Stable color for a tag with no override map available; the hash default.
+/// Only the tests need this now (production always routes through the override
+/// map), so it is gated to test builds to stay clear of dead-code warnings.
+#[cfg(test)]
+pub(crate) fn tag_color(tag: &str, p: &Palette) -> Color {
+    default_tag_accent(tag).color(p)
+}
+
+/// Leading attention edge for a tag group header: the strongest state across the
+/// group's members, colored as the sidebar colors that state. `Working` shows no
+/// colored edge (a dim space), matching the boards' quiet treatment of working.
+fn tag_group_edge(need: Option<NeedLevel>, p: &Palette) -> Span<'static> {
+    match need {
+        Some(NeedLevel::Blocked) => Span::styled("▎", Style::default().fg(p.red)),
+        Some(NeedLevel::NeedsYou) => Span::styled("▎", Style::default().fg(p.green)),
+        Some(NeedLevel::Idle) => Span::styled("▎", Style::default().fg(p.yellow)),
+        // Working or empty: no colored edge, just a placeholder cell so the
+        // chevron column stays aligned across headers.
+        _ => Span::styled(" ", Style::default().fg(p.overlay0)),
+    }
+}
+
+fn render_tag_group_header(
+    app: &AppState,
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    list_bottom: u16,
+) {
+    if card.rect.y >= list_bottom {
+        return;
+    }
+    let p = &app.palette;
+    let Some(tag) = app.workspaces.get(card.ws_idx).and_then(|ws| ws.tag()) else {
+        return;
+    };
+    // Count top-level workspaces (worktree children fold into their parent block),
+    // so the header count matches the number of rows the group expands to.
+    let count = workspace_list_entries(app)
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry, WorkspaceListEntry::Workspace { indented: false, ws_idx }
+                if app.workspaces.get(*ws_idx).and_then(|ws| ws.tag()) == Some(tag))
+        })
+        .count();
+    // Rolled-up attention across every workspace carrying this tag drives the edge.
+    let member_states: Vec<(AgentState, bool)> = app
+        .workspaces
+        .iter()
+        .filter(|ws| ws.tag() == Some(tag))
+        .map(|ws| ws.aggregate_state(&app.terminals))
+        .collect();
+    let need = need_rollup(&member_states);
+    let color = tag_color_with_overrides(tag, &app.tag_colors, p);
+    let collapsed = app.collapsed_space_keys.contains(&tag_collapse_key(tag));
+    let chevron = if collapsed { "▸" } else { "▾" };
+    let spans = vec![
+        tag_group_edge(need, p),
+        Span::styled(format!("{chevron} "), Style::default().fg(color)),
+        Span::styled(
+            tag.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {count}"), Style::default().fg(p.overlay0)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(card.rect.x, card.rect.y, card.rect.width, 1),
+    );
 }
 
 fn render_workspace_list(
@@ -1246,6 +1921,10 @@ fn render_workspace_list(
 
     for card in cards {
         let i = card.ws_idx;
+        if card.is_tag_header {
+            render_tag_group_header(app, frame, card, list_bottom);
+            continue;
+        }
         let ws = &app.workspaces[i];
         let row_y = card.rect.y;
         let row_height = card.rect.height;
@@ -1323,8 +2002,16 @@ fn render_workspace_list(
                 ahead_behind: ws.git_ahead_behind(),
                 tokens: &token_values,
                 suppress_git_details: card.indented,
+                agents: workspace_agent_summary(app, ws),
             },
         );
+
+        // Leading attention edge for this row, colored by the workspace's own
+        // rolled-up need exactly as the tag-group headers color theirs. Top-level
+        // rows (grouped tag members included) carry it in their first cell, which
+        // was previously blank pad, so nothing shifts. Worktree children keep their
+        // tree-connector column untouched and take no edge.
+        let row_edge = tag_group_edge(need_rollup(&[(agg_state, agg_seen)]), p);
 
         for (row_index, resolved) in rows.iter().enumerate() {
             if row_index as u16 >= row_height || row_y + row_index as u16 >= list_bottom {
@@ -1348,10 +2035,13 @@ fn render_workspace_list(
                     8
                 }
             } else if row_index == 0 {
-                spans.push(Span::raw(" "));
+                // Edge in the first cell, in place of the one-cell pad.
+                spans.push(row_edge.clone());
                 1
             } else {
-                spans.push(Span::raw("   "));
+                // Edge spans the row's later lines too, keeping the two-cell pad.
+                spans.push(row_edge.clone());
+                spans.push(Span::raw("  "));
                 3
             };
             let trailing_width = if row_index == 0 && parent_group.is_some() {
@@ -1429,6 +2119,38 @@ fn render_workspace_list(
     }
 }
 
+/// Render one agents-panel tag group header at `row_y`: leading attention edge,
+/// colored chevron, bold tag name in its stable color, dim count. Mirrors the
+/// spaces list's `render_tag_group_header`; the agents panel does not indent
+/// member rows, so the header carries no indent either.
+fn render_agent_tag_group_header(
+    app: &AppState,
+    frame: &mut Frame,
+    body: Rect,
+    row_y: u16,
+    tag: &str,
+    count: usize,
+    collapsed: bool,
+    need: Option<NeedLevel>,
+) {
+    let p = &app.palette;
+    let color = tag_color_with_overrides(tag, &app.tag_colors, p);
+    let chevron = if collapsed { "▸" } else { "▾" };
+    let spans = vec![
+        tag_group_edge(need, p),
+        Span::styled(format!("{chevron} "), Style::default().fg(color)),
+        Span::styled(
+            tag.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {count}"), Style::default().fg(p.overlay0)),
+    ];
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(body.x, row_y, body.width, 1),
+    );
+}
+
 fn render_agent_detail(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1492,7 +2214,30 @@ fn render_agent_detail(
     let scroll = app.agent_panel_scroll.min(metrics.max_offset_from_bottom);
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
-    for (index, detail) in details.iter().enumerate().skip(scroll) {
+    let display_rows = agent_panel_display_rows(app, &details);
+    for (index, row) in display_rows.iter().enumerate().skip(scroll) {
+        let gap = agent_display_row_gap(app, &display_rows, index);
+        let entry_idx = match row {
+            AgentPanelRow::Header {
+                tag,
+                count,
+                collapsed,
+                need,
+            } => {
+                if row_y >= body_bottom {
+                    break;
+                }
+                render_agent_tag_group_header(
+                    app, frame, body, row_y, tag, *count, *collapsed, *need,
+                );
+                row_y = row_y.saturating_add(1).saturating_add(gap).min(body_bottom);
+                continue;
+            }
+            AgentPanelRow::Entry { entry_idx } => *entry_idx,
+        };
+        let Some(detail) = details.get(entry_idx) else {
+            continue;
+        };
         let label_color = state_label_color(detail.state, detail.seen, p);
         let rows = resolved_agent_rows(app, detail);
         let height = (rows.len().max(1) as u16).min(body.height);
@@ -1539,7 +2284,7 @@ fn render_agent_detail(
         }
         row_y = row_y
             .saturating_add(height)
-            .saturating_add(agent_entry_gap(app, index, details.len()))
+            .saturating_add(gap)
             .min(body_bottom);
     }
 
@@ -2674,6 +3419,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
             ws_idx: 0,
             rect: Rect::new(0, 1, 15, 2),
             indented: false,
+            is_tag_header: false,
         }];
 
         let mut terminal = Terminal::new(TestBackend::new(15, 6)).expect("test terminal");
@@ -3173,6 +3919,775 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                     indented: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn group_entries_by_tag_orders_groups_by_first_appearance_then_untagged() {
+        let tags = vec![
+            Some("research".to_string()),
+            None,
+            Some("teaching".to_string()),
+            Some("research".to_string()),
+            None,
+        ];
+
+        let grouping = group_entries_by_tag(&tags);
+
+        assert_eq!(
+            grouping.groups,
+            vec![
+                TagGroup {
+                    tag: "research".to_string(),
+                    member_entry_indices: vec![0, 3],
+                },
+                TagGroup {
+                    tag: "teaching".to_string(),
+                    member_entry_indices: vec![2],
+                },
+            ]
+        );
+        assert_eq!(grouping.ungrouped, vec![1, 4]);
+    }
+
+    #[test]
+    fn group_entries_by_tag_treats_empty_string_as_untagged() {
+        let tags = vec![Some(String::new()), Some("a".to_string())];
+
+        let grouping = group_entries_by_tag(&tags);
+
+        assert_eq!(grouping.ungrouped, vec![0]);
+        assert_eq!(grouping.groups.len(), 1);
+        assert_eq!(grouping.groups[0].tag, "a");
+    }
+
+    #[test]
+    fn group_entries_by_tag_without_tags_is_all_ungrouped() {
+        let tags = vec![None, None, None];
+
+        let grouping = group_entries_by_tag(&tags);
+
+        assert!(grouping.groups.is_empty());
+        assert_eq!(grouping.ungrouped, vec![0, 1, 2]);
+    }
+
+    fn tagged_workspace(name: &str, tag: Option<&str>) -> Workspace {
+        let mut ws = Workspace::test_new(name);
+        ws.tag = tag.map(str::to_string);
+        ws
+    }
+
+    #[test]
+    fn tag_layout_rows_places_header_before_each_group_and_untagged_last() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("research")),
+            tagged_workspace("b", None),
+            tagged_workspace("c", Some("research")),
+            tagged_workspace("d", Some("teaching")),
+        ];
+
+        let rows = tag_layout_rows(&app);
+
+        assert_eq!(
+            rows,
+            vec![
+                TagLayoutRow::Header {
+                    tag: "research".to_string(),
+                    count: 2,
+                    collapsed: false,
+                    first_ws_idx: 0,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 0,
+                        indented: false,
+                    },
+                    grouped: true,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 2,
+                        indented: false,
+                    },
+                    grouped: true,
+                },
+                TagLayoutRow::Header {
+                    tag: "teaching".to_string(),
+                    count: 1,
+                    collapsed: false,
+                    first_ws_idx: 3,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 3,
+                        indented: false,
+                    },
+                    grouped: true,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 1,
+                        indented: false,
+                    },
+                    grouped: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_tag_group_hides_members_but_keeps_header() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("research")),
+            tagged_workspace("c", Some("research")),
+            tagged_workspace("b", None),
+        ];
+        app.collapsed_space_keys
+            .insert(tag_collapse_key("research"));
+
+        let rows = tag_layout_rows(&app);
+
+        assert_eq!(
+            rows,
+            vec![
+                TagLayoutRow::Header {
+                    tag: "research".to_string(),
+                    count: 2,
+                    collapsed: true,
+                    first_ws_idx: 0,
+                },
+                TagLayoutRow::Entry {
+                    entry: WorkspaceListEntry::Workspace {
+                        ws_idx: 2,
+                        indented: false,
+                    },
+                    grouped: false,
+                },
+            ]
+        );
+        assert_eq!(workspace_display_order(&app), vec![2]);
+    }
+
+    #[test]
+    fn grouped_member_card_indents_two_cells_untagged_stays_at_column_zero() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("research")),
+            tagged_workspace("b", None),
+        ];
+
+        let area = Rect::new(0, 0, 30, 20);
+        let body =
+            workspace_list_body_rect(workspace_list_rect(area, app.sidebar_section_split), false);
+        let (cards, _) = compute_workspace_list_areas(&app, area);
+
+        // header (ws 0), grouped member (ws 0), untagged remainder (ws 1).
+        let grouped = cards
+            .iter()
+            .find(|c| c.ws_idx == 0 && !c.is_tag_header)
+            .unwrap();
+        let untagged = cards.iter().find(|c| c.ws_idx == 1).unwrap();
+
+        assert_eq!(grouped.rect.x, body.x + 2);
+        assert_eq!(grouped.rect.width, body.width - 2);
+        assert_eq!(untagged.rect.x, body.x);
+        assert_eq!(untagged.rect.width, body.width);
+    }
+
+    #[test]
+    fn tag_color_is_stable_for_the_same_tag() {
+        let p = Palette::catppuccin();
+        assert_eq!(tag_color("research", &p), tag_color("research", &p));
+        assert_eq!(tag_color("teaching", &p), tag_color("teaching", &p));
+    }
+
+    #[test]
+    fn tag_color_differs_for_two_known_different_tags() {
+        let p = Palette::catppuccin();
+        // "research" hashes to bucket 3 (yellow), "teaching" to bucket 1 (teal),
+        // so the two land on different palette colors.
+        assert_ne!(tag_color("research", &p), tag_color("teaching", &p));
+    }
+
+    #[test]
+    fn tag_color_never_returns_red() {
+        let p = Palette::catppuccin();
+        for tag in [
+            "research", "teaching", "prepara", "a", "b", "c", "d", "e", "zzz", "ops", "docs",
+            "video",
+        ] {
+            assert_ne!(tag_color(tag, &p), p.red);
+        }
+    }
+
+    #[test]
+    fn tag_color_override_beats_the_hash_default() {
+        let p = Palette::catppuccin();
+        let mut overrides = std::collections::HashMap::new();
+        // "research" hashes to a non-mauve default; an explicit mauve override wins.
+        overrides.insert("research".to_string(), TagAccent::Mauve.id().to_string());
+        assert_eq!(
+            tag_color_with_overrides("research", &overrides, &p),
+            p.mauve
+        );
+        // A tag without an override keeps its stable-hash color.
+        assert_eq!(
+            tag_color_with_overrides("teaching", &overrides, &p),
+            tag_color("teaching", &p)
+        );
+    }
+
+    #[test]
+    fn tag_color_override_with_unknown_id_falls_back_to_hash_default() {
+        let p = Palette::catppuccin();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("research".to_string(), "chartreuse".to_string());
+        assert_eq!(
+            tag_color_with_overrides("research", &overrides, &p),
+            tag_color("research", &p)
+        );
+    }
+
+    #[test]
+    fn tag_accent_ids_round_trip_and_default_never_mauve() {
+        for accent in TagAccent::ALL {
+            assert_eq!(TagAccent::from_id(accent.id()), Some(accent));
+        }
+        // The hash default reaches only the historical four; mauve is pick-only.
+        for tag in ["research", "teaching", "prepara", "a", "b", "zzz", "docs"] {
+            assert_ne!(default_tag_accent(tag), TagAccent::Mauve);
+        }
+    }
+
+    #[test]
+    fn sort_tag_groups_name_orders_alphabetically_case_insensitive() {
+        let mut groups = vec![
+            TagGroup {
+                tag: "teaching".into(),
+                member_entry_indices: vec![0],
+            },
+            TagGroup {
+                tag: "Research".into(),
+                member_entry_indices: vec![1],
+            },
+            TagGroup {
+                tag: "prepara".into(),
+                member_entry_indices: vec![2],
+            },
+        ];
+        sort_tag_groups(&mut groups, crate::config::TagSortMode::Name, &[]);
+        let names: Vec<_> = groups.iter().map(|g| g.tag.as_str()).collect();
+        assert_eq!(names, vec!["prepara", "Research", "teaching"]);
+    }
+
+    #[test]
+    fn sort_tag_groups_manual_follows_order_then_first_appearance_for_unknowns() {
+        let mut groups = vec![
+            TagGroup {
+                tag: "research".into(),
+                member_entry_indices: vec![0],
+            },
+            TagGroup {
+                tag: "teaching".into(),
+                member_entry_indices: vec![1],
+            },
+            TagGroup {
+                tag: "prepara".into(),
+                member_entry_indices: vec![2],
+            },
+        ];
+        // Manual order lists teaching then prepara; research is unknown, so it keeps
+        // its first-appearance slot after the listed ones.
+        let manual = vec!["teaching".to_string(), "prepara".to_string()];
+        sort_tag_groups(&mut groups, crate::config::TagSortMode::Manual, &manual);
+        let names: Vec<_> = groups.iter().map(|g| g.tag.as_str()).collect();
+        assert_eq!(names, vec!["teaching", "prepara", "research"]);
+    }
+
+    #[test]
+    fn sort_tag_groups_first_appearance_leaves_input_order() {
+        let mut groups = vec![
+            TagGroup {
+                tag: "teaching".into(),
+                member_entry_indices: vec![0],
+            },
+            TagGroup {
+                tag: "research".into(),
+                member_entry_indices: vec![1],
+            },
+        ];
+        sort_tag_groups(
+            &mut groups,
+            crate::config::TagSortMode::FirstAppearance,
+            &["research".to_string()],
+        );
+        let names: Vec<_> = groups.iter().map(|g| g.tag.as_str()).collect();
+        assert_eq!(names, vec!["teaching", "research"]);
+    }
+
+    #[test]
+    fn tag_layout_rows_honor_manual_order_in_both_the_header_and_members() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("research")),
+            tagged_workspace("b", Some("teaching")),
+        ];
+        app.sidebar_spaces.tag_sort = crate::config::TagSortMode::Manual;
+        app.tag_order = vec!["teaching".to_string(), "research".to_string()];
+
+        let headers: Vec<_> = tag_layout_rows(&app)
+            .into_iter()
+            .filter_map(|row| match row {
+                TagLayoutRow::Header { tag, .. } => Some(tag),
+                TagLayoutRow::Entry { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec!["teaching".to_string(), "research".to_string()]
+        );
+        assert_eq!(
+            ordered_tag_names(&app),
+            vec!["teaching".to_string(), "research".to_string()]
+        );
+    }
+
+    #[test]
+    fn tag_layout_rows_name_mode_sorts_headers_alphabetically() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("teaching")),
+            tagged_workspace("b", Some("research")),
+        ];
+        app.sidebar_spaces.tag_sort = crate::config::TagSortMode::Name;
+
+        assert_eq!(
+            ordered_tag_names(&app),
+            vec!["research".to_string(), "teaching".to_string()]
+        );
+    }
+
+    #[test]
+    fn need_rollup_empty_is_none() {
+        assert_eq!(need_rollup(&[]), None);
+    }
+
+    #[test]
+    fn need_rollup_orders_blocked_over_needs_you_over_working_over_idle() {
+        // Blocked wins over everything.
+        assert_eq!(
+            need_rollup(&[
+                (AgentState::Idle, true),
+                (AgentState::Working, true),
+                (AgentState::Idle, false),
+                (AgentState::Blocked, true),
+            ]),
+            Some(NeedLevel::Blocked)
+        );
+        // NeedsYou (idle + unseen) wins over working and idle-seen.
+        assert_eq!(
+            need_rollup(&[
+                (AgentState::Idle, true),
+                (AgentState::Working, true),
+                (AgentState::Idle, false),
+            ]),
+            Some(NeedLevel::NeedsYou)
+        );
+        // Working wins over idle-seen.
+        assert_eq!(
+            need_rollup(&[(AgentState::Idle, true), (AgentState::Working, true)]),
+            Some(NeedLevel::Working)
+        );
+        // Idle-seen is the floor.
+        assert_eq!(
+            need_rollup(&[(AgentState::Idle, true)]),
+            Some(NeedLevel::Idle)
+        );
+        // Unknown-only rolls up to nothing.
+        assert_eq!(need_rollup(&[(AgentState::Unknown, true)]), None);
+    }
+
+    /// Build an app whose workspaces each own one detected agent, tagged as
+    /// given, with a state/seen pair, so the agents panel produces one entry per
+    /// workspace. Returns the app ready for `agent_panel_entries`.
+    fn tagged_agent_app(specs: &[(&str, Option<&str>, AgentState, bool)]) -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces = specs
+            .iter()
+            .map(|(name, tag, _, _)| tagged_workspace(name, *tag))
+            .collect();
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+        for (ws_idx, (_, _, state, seen)) in specs.iter().enumerate() {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            let terminal = app.terminals.get_mut(&terminal_id).unwrap();
+            terminal.detected_agent = Some(Agent::Claude);
+            terminal.state = *state;
+            app.workspaces[ws_idx].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = *seen;
+        }
+        app
+    }
+
+    #[test]
+    fn agent_panel_display_rows_group_by_inherited_tag_first_appearance_untagged_last() {
+        let app = tagged_agent_app(&[
+            ("a", Some("research"), AgentState::Idle, true),
+            ("b", None, AgentState::Idle, true),
+            ("c", Some("research"), AgentState::Idle, true),
+            ("d", Some("teaching"), AgentState::Idle, true),
+        ]);
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        // research header, its two members (entry idx 0 and 2), teaching header,
+        // its member (entry idx 3), then the untagged remainder (entry idx 1).
+        let header_tags: Vec<(&str, usize)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                AgentPanelRow::Header { tag, count, .. } => Some((tag.as_str(), *count)),
+                AgentPanelRow::Entry { .. } => None,
+            })
+            .collect();
+        assert_eq!(header_tags, vec![("research", 2), ("teaching", 1)]);
+
+        let entry_order: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| match row {
+                AgentPanelRow::Entry { entry_idx } => Some(*entry_idx),
+                AgentPanelRow::Header { .. } => None,
+            })
+            .collect();
+        // Members are pulled under their header in original order; untagged last.
+        assert_eq!(entry_order, vec![0, 2, 3, 1]);
+    }
+
+    #[test]
+    fn agent_panel_no_tags_yields_plain_entry_rows_without_headers() {
+        let app = tagged_agent_app(&[
+            ("a", None, AgentState::Idle, true),
+            ("b", None, AgentState::Working, true),
+        ]);
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        assert_eq!(
+            rows,
+            vec![
+                AgentPanelRow::Entry { entry_idx: 0 },
+                AgentPanelRow::Entry { entry_idx: 1 },
+            ]
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| matches!(row, AgentPanelRow::Header { .. })));
+    }
+
+    #[test]
+    fn collapsed_agent_tag_group_hides_members_but_keeps_header() {
+        let mut app = tagged_agent_app(&[
+            ("a", Some("research"), AgentState::Idle, true),
+            ("c", Some("research"), AgentState::Idle, true),
+            ("b", None, AgentState::Idle, true),
+        ]);
+        app.collapsed_space_keys
+            .insert(agent_tag_collapse_key("research"));
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        assert_eq!(
+            rows,
+            vec![
+                AgentPanelRow::Header {
+                    tag: "research".to_string(),
+                    count: 2,
+                    collapsed: true,
+                    need: Some(NeedLevel::Idle),
+                },
+                AgentPanelRow::Entry { entry_idx: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_tag_header_rolls_up_the_strongest_member_state() {
+        // One research agent is blocked, the other idle-seen: the header's rolled
+        // up need is Blocked, the strongest across the members. A separate teaching
+        // agent that is idle-and-unseen rolls up to NeedsYou.
+        let app = tagged_agent_app(&[
+            ("a", Some("research"), AgentState::Idle, true),
+            ("b", Some("research"), AgentState::Blocked, true),
+            ("c", Some("teaching"), AgentState::Idle, false),
+        ]);
+        let entries = agent_panel_entries(&app);
+        let rows = agent_panel_display_rows(&app, &entries);
+
+        let needs: Vec<(&str, Option<NeedLevel>)> = rows
+            .iter()
+            .filter_map(|row| match row {
+                AgentPanelRow::Header { tag, need, .. } => Some((tag.as_str(), *need)),
+                AgentPanelRow::Entry { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            needs,
+            vec![
+                ("research", Some(NeedLevel::Blocked)),
+                ("teaching", Some(NeedLevel::NeedsYou)),
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_tag_group_collapse_key_is_distinct_from_the_spaces_key() {
+        assert_eq!(agent_tag_collapse_key("research"), "agent-tag:research");
+        assert_ne!(
+            agent_tag_collapse_key("research"),
+            tag_collapse_key("research")
+        );
+    }
+
+    #[test]
+    fn agent_panel_renders_tag_headers_above_their_member_rows() {
+        let app = tagged_agent_app(&[
+            ("alpha", Some("research"), AgentState::Idle, true),
+            ("bravo", None, AgentState::Idle, true),
+        ]);
+        let area = Rect::new(0, 0, 30, 24);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let (_, agent_area) = expanded_sidebar_sections(area, app.sidebar_section_split);
+        let body = agent_panel_body_rect(agent_area, false);
+
+        // The first body row is the research header (chevron + tag name), the
+        // agent row for "alpha" follows below it.
+        let header = row_text(buffer, body.y, area.width);
+        assert!(
+            header.contains("research"),
+            "expected tag header, got {header:?}"
+        );
+        assert!(
+            header.contains("▾"),
+            "expected open chevron, got {header:?}"
+        );
+        let member = row_text(buffer, body.y + 1, area.width);
+        assert!(
+            member.contains("alpha"),
+            "expected member row, got {member:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_rows_carry_a_need_edge_colored_by_their_own_rollup() {
+        // Two top-level spaces: the first finished and unseen (needs you), the
+        // second actively working. The row's first cell should carry the green
+        // edge for the first and a blank cell for the second, mirroring how the
+        // tag-group headers color their leading edge.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("needsyou"),
+            Workspace::test_new("working"),
+        ];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        let set_state = |app: &mut crate::app::state::AppState, ws_idx: usize, state, seen| {
+            let pane = app.workspaces[ws_idx].tabs[0].root_pane;
+            let terminal_id = app.workspaces[ws_idx].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone();
+            app.terminals.get_mut(&terminal_id).unwrap().state = state;
+            app.workspaces[ws_idx].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = seen;
+        };
+        // Idle + unseen rolls up to NeedsYou (green); Working rolls up to no edge.
+        set_state(&mut app, 0, AgentState::Idle, false);
+        set_state(&mut app, 1, AgentState::Working, true);
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let needs_you = app.view.workspace_card_areas[0].rect;
+        let working = app.view.workspace_card_areas[1].rect;
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let needs_you_edge = &buffer[(needs_you.x, needs_you.y)];
+        assert_eq!(needs_you_edge.symbol(), "▎");
+        assert_eq!(needs_you_edge.style().fg, Some(app.palette.green));
+
+        let working_edge = &buffer[(working.x, working.y)];
+        assert_eq!(working_edge.symbol(), " ");
+        assert_ne!(working_edge.style().fg, Some(app.palette.green));
+    }
+
+    #[test]
+    fn top_level_space_with_a_branch_draws_its_second_line() {
+        // Regression guard: a top-level (ungrouped, non-worktree-child) space whose
+        // config carries a branch row must render that branch on a second line. The
+        // whole chain runs for real - compute_workspace_card_areas derives the card
+        // height from space_rows, and render_workspace_list draws each resolved row -
+        // so a card truncated to one line (the tag-grouping regression) is caught here.
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("repo");
+        ws.cached_git_branch = Some("feature-branch".into());
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        // The default spaces layout is [[state_icon, workspace], [branch, git_status]].
+        assert_eq!(app.sidebar_spaces.rows.len(), 2);
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let card = app.view.workspace_card_areas[0].rect;
+        assert!(
+            card.height >= 2,
+            "a space with a branch must get a card at least two rows tall, got {}",
+            card.height
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let second_line = row_text(buffer, card.y + 1, area.width);
+        assert!(
+            second_line.contains("feature-branch"),
+            "second card line should carry the branch, got {second_line:?}"
+        );
+    }
+
+    #[test]
+    fn felipe_three_row_space_layout_draws_branch_and_usage_lines() {
+        // Reproduces Felipe's live [ui.sidebar.spaces] layout verbatim -
+        // [[state_icon, workspace(styled)], [branch, git_status], [$usage]] - for a
+        // plain top-level space carrying a branch and a $usage token. All three rows
+        // must survive: the card is three tall and the branch and usage each land on
+        // their own line. Guards the post-swap regression where every space collapsed
+        // to a single line.
+        let mut app = crate::app::state::AppState::test_new();
+        app.sidebar_spaces = crate::config::SpacesSidebarConfig {
+            rows: vec![
+                vec![
+                    crate::config::SpaceSidebarToken::StateIcon,
+                    crate::config::SpaceSidebarToken::Styled {
+                        token: Box::new(crate::config::SpaceSidebarToken::Workspace),
+                        style: crate::config::SidebarTokenStyle::default(),
+                    },
+                ],
+                vec![
+                    crate::config::SpaceSidebarToken::Branch,
+                    crate::config::SpaceSidebarToken::GitStatus,
+                ],
+                vec![crate::config::SpaceSidebarToken::Custom("usage".into())],
+            ],
+            row_gap: 0,
+            tag_sort: crate::config::TagSortMode::default(),
+        };
+        let mut ws = Workspace::test_new("repo");
+        ws.cached_git_branch = Some("mainline".into());
+        ws.metadata_tokens.patch(
+            std::collections::HashMap::from([("usage".to_string(), Some("42%".to_string()))]),
+            None,
+            std::time::Instant::now(),
+        );
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        let area = Rect::new(0, 0, 26, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        let card = app.view.workspace_card_areas[0].rect;
+        assert_eq!(
+            card.height, 3,
+            "the three-row layout must yield a three-row-tall card"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let branch_line = row_text(buffer, card.y + 1, area.width);
+        assert!(
+            branch_line.contains("mainline"),
+            "second card line should carry the branch, got {branch_line:?}"
+        );
+        let usage_line = row_text(buffer, card.y + 2, area.width);
+        assert!(
+            usage_line.contains("42%"),
+            "third card line should carry the usage token, got {usage_line:?}"
+        );
+    }
+
+    #[test]
+    fn tagged_space_still_draws_its_branch_line_under_the_group_indent() {
+        // A tagged workspace routes through tag_layout_rows and gets the two-cell
+        // group indent (compute_workspace_list_areas shifts a grouped card x+2,
+        // width-2). Confirm that indent does not swallow the second (branch) line:
+        // the card stays two rows tall and the branch still renders on line two,
+        // shifted right by the indent.
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("repo");
+        ws.cached_git_branch = Some("mainline".into());
+        ws.set_tag(Some("teaching".into()));
+        app.workspaces = vec![ws];
+        app.ensure_test_terminals();
+        app.active = None;
+        app.mode = Mode::Terminal;
+
+        assert!(has_tag_groups(&app), "the workspace should be tagged");
+
+        let area = Rect::new(0, 0, 30, 20);
+        app.view.workspace_card_areas = compute_workspace_card_areas(&app, area);
+        // Card 0 is the tag header; card 1 is the workspace itself.
+        let ws_card = app
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| !card.is_tag_header)
+            .expect("a workspace card")
+            .rect;
+        assert_eq!(
+            ws_card.height, 2,
+            "the two-row layout must survive the group indent"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_sidebar(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let branch_line = row_text(buffer, ws_card.y + 1, area.width);
+        assert!(
+            branch_line.contains("mainline"),
+            "second card line should carry the branch even when grouped, got {branch_line:?}"
         );
     }
 }

@@ -20,8 +20,41 @@ pub(super) enum ResolvedTokenKind {
     Agent(String),
     TerminalTitle(String),
     Branch(String),
-    GitStatus { ahead: usize, behind: usize },
+    GitStatus {
+        ahead: usize,
+        behind: usize,
+    },
+    /// The rendered agent summary for a space, e.g. "3 agents · 1 need you".
+    SpaceAgents(String),
+    NeedEdge {
+        state: crate::detect::AgentState,
+        seen: bool,
+    },
+    Waiting {
+        text: String,
+        state: crate::detect::AgentState,
+    },
     Custom(String),
+}
+
+/// True when the agent is sitting on Felipe's time: finished and not yet
+/// looked at, or blocked on a question.
+pub(super) fn needs_attention(state: crate::detect::AgentState, seen: bool) -> bool {
+    matches!(
+        (state, seen),
+        (crate::detect::AgentState::Blocked, _) | (crate::detect::AgentState::Idle, false)
+    )
+}
+
+fn waiting_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("waiting {secs}s")
+    } else if secs < 3600 {
+        format!("waiting {}m", secs / 60)
+    } else {
+        format!("waiting {}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 impl ResolvedToken {
@@ -73,6 +106,17 @@ pub(super) fn agent_rows(
                             .terminal_title_stripped
                             .clone()
                             .map(ResolvedTokenKind::TerminalTitle),
+                        AgentSidebarToken::NeedEdge => Some(ResolvedTokenKind::NeedEdge {
+                            state: entry.state,
+                            seen: entry.seen,
+                        }),
+                        AgentSidebarToken::Waiting => needs_attention(entry.state, entry.seen)
+                            .then_some(entry.last_agent_state_change_at)
+                            .flatten()
+                            .map(|at| ResolvedTokenKind::Waiting {
+                                text: waiting_text(at.elapsed()),
+                                state: entry.state,
+                            }),
                         AgentSidebarToken::Custom(name) => entry
                             .tokens
                             .get(name)
@@ -83,7 +127,12 @@ pub(super) fn agent_rows(
                     Some(ResolvedToken::new(kind, style))
                 })
                 .collect::<Vec<_>>();
-            (!resolved.is_empty()).then_some(resolved)
+            // The need edge is a gutter, not content: a row carrying nothing
+            // else (e.g. [need_edge, waiting] while the agent works) elides.
+            let has_content = resolved
+                .iter()
+                .any(|token| !matches!(token.kind, ResolvedTokenKind::NeedEdge { .. }));
+            has_content.then_some(resolved)
         })
         .collect()
 }
@@ -95,6 +144,25 @@ pub(super) struct SpaceTokenContext<'a> {
     pub ahead_behind: Option<(usize, usize)>,
     pub tokens: &'a std::collections::HashMap<String, String>,
     pub suppress_git_details: bool,
+    /// (total known agents in this space, how many need attention). The `agents`
+    /// token renders "N agents" plus "· M need you" when M > 0, and its row elides
+    /// when total is 0.
+    pub agents: (usize, usize),
+}
+
+/// One-line agent summary for a space: "N agents", with "· M need you" appended
+/// when M of them are blocked or finished-and-unseen. `None` when the space has no
+/// known agents, so the `agents` row elides.
+fn agent_summary_text(total: usize, needs_you: usize) -> Option<String> {
+    if total == 0 {
+        return None;
+    }
+    let noun = if total == 1 { "agent" } else { "agents" };
+    let mut summary = format!("{total} {noun}");
+    if needs_you > 0 {
+        summary.push_str(&format!(" · {needs_you} need you"));
+    }
+    Some(summary)
 }
 
 pub(super) fn space_rows(
@@ -126,6 +194,10 @@ pub(super) fn space_rows(
                             .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
                             .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
                         SpaceSidebarToken::GitStatus => None,
+                        SpaceSidebarToken::Agents => {
+                            agent_summary_text(context.agents.0, context.agents.1)
+                                .map(ResolvedTokenKind::SpaceAgents)
+                        }
                         SpaceSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -142,7 +214,10 @@ pub(super) fn space_rows(
 }
 
 pub(super) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
-    if matches!(previous.kind, ResolvedTokenKind::StateIcon)
+    if matches!(previous.kind, ResolvedTokenKind::NeedEdge { .. }) {
+        // The edge is a gutter; content hugs it.
+        ""
+    } else if matches!(previous.kind, ResolvedTokenKind::StateIcon)
         || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
     {
         " "
@@ -173,6 +248,7 @@ mod tests {
             state: AgentState::Working,
             seen: true,
             last_agent_state_change_seq: None,
+            last_agent_state_change_at: None,
             state_labels: std::collections::HashMap::new(),
             tokens: std::collections::HashMap::new(),
         }
@@ -287,6 +363,69 @@ mod tests {
     }
 
     #[test]
+    fn need_edge_and_waiting_resolve_from_agent_need_state() {
+        let mut entry = entry();
+        entry.state = AgentState::Idle;
+        entry.seen = false;
+        entry.last_agent_state_change_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(725));
+        let config = AgentsSidebarConfig {
+            rows: vec![
+                vec![AgentSidebarToken::NeedEdge, AgentSidebarToken::Workspace],
+                vec![AgentSidebarToken::NeedEdge, AgentSidebarToken::Waiting],
+            ],
+            ..Default::default()
+        };
+
+        let rows = agent_rows(&config, &entry, "done");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0][0],
+            ResolvedToken::unstyled(ResolvedTokenKind::NeedEdge {
+                state: AgentState::Idle,
+                seen: false,
+            })
+        );
+        assert_eq!(
+            rows[1][1],
+            ResolvedToken::unstyled(ResolvedTokenKind::Waiting {
+                text: "waiting 12m".into(),
+                state: AgentState::Idle,
+            })
+        );
+
+        // A working agent keeps its edge slot (blank in the renderer) but the
+        // waiting row elides entirely.
+        entry.state = AgentState::Working;
+        entry.seen = true;
+        let rows = agent_rows(&config, &entry, "working");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0],
+            ResolvedToken::unstyled(ResolvedTokenKind::NeedEdge {
+                state: AgentState::Working,
+                seen: true,
+            })
+        );
+    }
+
+    #[test]
+    fn waiting_text_scales_by_duration() {
+        assert_eq!(
+            waiting_text(std::time::Duration::from_secs(45)),
+            "waiting 45s"
+        );
+        assert_eq!(
+            waiting_text(std::time::Duration::from_secs(725)),
+            "waiting 12m"
+        );
+        assert_eq!(
+            waiting_text(std::time::Duration::from_secs(3600 + 720)),
+            "waiting 1h 12m"
+        );
+    }
+
+    #[test]
     fn grouped_children_suppress_all_builtin_git_details() {
         let config = SpacesSidebarConfig::default();
 
@@ -300,6 +439,7 @@ mod tests {
                     ahead_behind: Some((2, 1)),
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
+                    agents: (0, 0),
                 },
             ),
             vec![vec![
@@ -327,11 +467,83 @@ mod tests {
                     ahead_behind: None,
                     tokens: &tokens,
                     suppress_git_details: false,
+                    agents: (0, 0),
                 },
             ),
             vec![vec![ResolvedToken::unstyled(ResolvedTokenKind::Custom(
                 "2 changes".into()
             ))]]
+        );
+    }
+
+    fn agents_config() -> SpacesSidebarConfig {
+        SpacesSidebarConfig {
+            rows: vec![vec![SpaceSidebarToken::Agents]],
+            ..Default::default()
+        }
+    }
+
+    fn agents_context(agents: (usize, usize)) -> SpaceTokenContext<'static> {
+        SpaceTokenContext {
+            workspace: "repo",
+            branch: None,
+            state_text: "idle",
+            ahead_behind: None,
+            tokens: EMPTY_TOKENS.get_or_init(std::collections::HashMap::new),
+            suppress_git_details: false,
+            agents,
+        }
+    }
+
+    static EMPTY_TOKENS: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+
+    #[test]
+    fn agents_token_elides_when_the_space_has_no_agents() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((0, 0))),
+            Vec::<Vec<ResolvedToken>>::new()
+        );
+    }
+
+    #[test]
+    fn agents_token_summarizes_a_count_with_no_attention_needed() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((3, 0))),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::SpaceAgents("3 agents".into())
+            )]]
+        );
+    }
+
+    #[test]
+    fn agents_token_appends_the_needs_you_count() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((3, 1))),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::SpaceAgents("3 agents · 1 need you".into())
+            )]]
+        );
+    }
+
+    #[test]
+    fn agents_token_uses_the_singular_noun_for_one_agent() {
+        assert_eq!(
+            space_rows(&agents_config(), agents_context((1, 1))),
+            vec![vec![ResolvedToken::unstyled(
+                ResolvedTokenKind::SpaceAgents("1 agent · 1 need you".into())
+            )]]
+        );
+    }
+
+    #[test]
+    fn agent_summary_text_covers_singular_plural_and_empty() {
+        assert_eq!(agent_summary_text(0, 0), None);
+        assert_eq!(agent_summary_text(1, 0).as_deref(), Some("1 agent"));
+        assert_eq!(agent_summary_text(2, 0).as_deref(), Some("2 agents"));
+        assert_eq!(
+            agent_summary_text(4, 2).as_deref(),
+            Some("4 agents · 2 need you")
         );
     }
 }

@@ -571,6 +571,26 @@ impl AppState {
                     } else {
                         self.view.workspace_card_areas.clone()
                     };
+                    if let Some(tag) = cards.iter().find_map(|card| {
+                        if !card.is_tag_header
+                            || mouse.row < card.rect.y
+                            || mouse.row >= card.rect.y + card.rect.height
+                        {
+                            return None;
+                        }
+                        self.workspaces
+                            .get(card.ws_idx)
+                            .and_then(|ws| ws.tag().map(str::to_string))
+                    }) {
+                        let key = crate::ui::tag_collapse_key(&tag);
+                        if self.collapsed_space_keys.contains(&key) {
+                            self.collapsed_space_keys.remove(&key);
+                        } else {
+                            self.collapsed_space_keys.insert(key);
+                        }
+                        self.mark_session_dirty();
+                        return None;
+                    }
                     if let Some(card) = cards.iter().find(|card| {
                         let chevron = crate::ui::workspace_group_chevron_rect(card);
                         mouse.row == chevron.y && mouse.column == chevron.x && chevron.width > 0
@@ -623,6 +643,17 @@ impl AppState {
                                 self.set_agent_panel_offset_from_bottom(offset_from_bottom);
                             }
                         }
+                        return None;
+                    }
+
+                    if let Some(tag) = self.agent_tag_header_at(mouse.row) {
+                        let key = crate::ui::agent_tag_collapse_key(&tag);
+                        if self.collapsed_space_keys.contains(&key) {
+                            self.collapsed_space_keys.remove(&key);
+                        } else {
+                            self.collapsed_space_keys.insert(key);
+                        }
+                        self.mark_session_dirty();
                         return None;
                     }
 
@@ -1043,6 +1074,27 @@ impl AppState {
                 {
                     return None;
                 }
+                if let Some(tag) = self.tag_header_at_row(mouse.row) {
+                    let collapsed = self
+                        .collapsed_space_keys
+                        .contains(&crate::ui::tag_collapse_key(&tag));
+                    let order = crate::ui::ordered_tag_names(self);
+                    let is_first = order.first().is_some_and(|first| *first == tag);
+                    let is_last = order.last().is_some_and(|last| *last == tag);
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::TagHeader {
+                            tag,
+                            collapsed,
+                            is_first,
+                            is_last,
+                        },
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                    return None;
+                }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
                     let kind = self
@@ -1076,7 +1128,13 @@ impl AppState {
                                     .is_some_and(|(_, collapsed)| *collapsed),
                             })
                         })
-                        .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
+                        .unwrap_or(ContextMenuKind::Workspace {
+                            ws_idx: idx,
+                            has_tag: self
+                                .workspaces
+                                .get(idx)
+                                .is_some_and(|ws| ws.tag().is_some()),
+                        });
                     self.context_menu = Some(ContextMenuState {
                         kind,
                         x: mouse.column,
@@ -3280,7 +3338,10 @@ mod tests {
     fn hovering_context_menu_updates_highlight() {
         let mut app = app_for_mouse_test();
         app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 0 },
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
             list: MenuListState::new(0),
@@ -3573,12 +3634,23 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
 
-        app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+        let mut menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
-        });
+            list: MenuListState::new(0),
+        };
+        // Select "Close" by label so menu growth cannot shift the target.
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("workspace menu should carry Close");
+        menu.list = MenuListState::new(close_idx);
+        app.state.context_menu = Some(menu);
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
             &mut app.state,
@@ -3613,19 +3685,29 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.confirm_close = false;
-        app.state.context_menu = Some(ContextMenuState {
-            kind: ContextMenuKind::Workspace { ws_idx: 1 },
+        let state_menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 1,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
-        });
+            list: MenuListState::new(0),
+        };
+        // Click the "Close" row by label so menu growth cannot shift the target.
+        let close_idx = state_menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("workspace menu should carry Close") as u16;
+        app.state.context_menu = Some(state_menu);
         app.state.mode = Mode::ContextMenu;
 
         let menu = app.state.context_menu_rect().unwrap();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 2,
+            menu.y + 1 + close_idx,
         ));
 
         assert_eq!(app.state.workspaces.len(), 1);
@@ -3660,7 +3742,7 @@ mod tests {
         app.state.selected = 0;
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let runtime_count = app.terminal_runtimes.len();
-        app.state.context_menu = Some(ContextMenuState {
+        let mut menu = ContextMenuState {
             kind: ContextMenuKind::Pane {
                 ws_idx: 0,
                 tab_idx: 0,
@@ -3671,8 +3753,16 @@ mod tests {
             },
             x: 2,
             y: 2,
-            list: MenuListState::new(1),
-        });
+            list: MenuListState::new(0),
+        };
+        // Select "Split right" by label so the test survives menu reordering.
+        let split_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Split right")
+            .expect("pane menu should carry Split right");
+        menu.list = MenuListState::new(split_idx);
+        app.state.context_menu = Some(menu);
         app.state.mode = Mode::ContextMenu;
 
         handle_context_menu_key(

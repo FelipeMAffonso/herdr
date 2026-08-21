@@ -652,6 +652,9 @@ pub struct WorkspaceCardArea {
     pub ws_idx: usize,
     pub rect: Rect,
     pub indented: bool,
+    /// When true, this card is a tag group header, not a workspace row. `ws_idx`
+    /// then points at the group's first workspace so its tag name is resolvable.
+    pub is_tag_header: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1196,12 +1199,28 @@ pub(crate) struct TabPressState {
 pub enum ContextMenuKind {
     Workspace {
         ws_idx: usize,
+        has_tag: bool,
     },
     GitWorkspace {
         ws_idx: usize,
         is_linked_worktree: bool,
         has_worktree_children: bool,
         collapsed: bool,
+    },
+    /// Right-click menu on a tag group header row: reorder, collapse/expand,
+    /// rename, and recolor the tag, all keyed by the tag name (not a ws_idx, so
+    /// the menu survives a collapsed group).
+    TagHeader {
+        tag: String,
+        collapsed: bool,
+        /// A group is at the top when no other group precedes it in display order.
+        is_first: bool,
+        /// A group is at the bottom when no other group follows it.
+        is_last: bool,
+    },
+    /// The tag color picker: one row per theme accent, keyed by the tag name.
+    TagColor {
+        tag: String,
     },
     Tab {
         ws_idx: usize,
@@ -1228,7 +1247,38 @@ pub struct ContextMenuState {
 impl ContextMenuState {
     pub fn items(&self) -> Vec<&'static str> {
         match self.kind {
-            ContextMenuKind::Workspace { .. } => vec!["Rename", "Close"],
+            ContextMenuKind::Workspace { has_tag, .. } => {
+                let mut items = vec!["Rename", "Tag..."];
+                if has_tag {
+                    items.push("Rename tag...");
+                    items.push("Tag color...");
+                    items.push("Remove tag");
+                }
+                items.push("Close");
+                items
+            }
+            ContextMenuKind::TagHeader {
+                collapsed,
+                is_first,
+                is_last,
+                ..
+            } => {
+                let mut items = Vec::new();
+                if !is_first {
+                    items.push("Move group up");
+                }
+                if !is_last {
+                    items.push("Move group down");
+                }
+                items.push(if collapsed { "Expand" } else { "Collapse" });
+                items.push("Rename tag...");
+                items.push("Tag color...");
+                items
+            }
+            ContextMenuKind::TagColor { .. } => crate::ui::TagAccent::ALL
+                .iter()
+                .map(|accent| accent.label())
+                .collect(),
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
@@ -1264,6 +1314,9 @@ impl ContextMenuState {
                 if source_pane_id.is_some() {
                     items.push("Swap with focused pane");
                 }
+                // Smart paste: routes by clipboard content - copied files paste as
+                // quoted paths, a snipped image as a temp-file path, text as itself.
+                items.push("Paste");
                 items.extend(["Split right", "Split down", "Zoom"]);
                 items.push(if right_click_passthrough {
                     "Use Herdr right-click menu"
@@ -1383,6 +1436,10 @@ pub struct AppState {
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
     pub mode: Mode,
+    /// While in `Mode::Prefix`, set once the which-key delay has elapsed or an
+    /// unbound key was pressed: the prefix overlay then expands from the slim hint
+    /// bar into the full which-key popup. Reset whenever prefix mode is left.
+    pub prefix_which_key_expanded: bool,
     pub should_quit: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
     pub detach_exits: bool,
@@ -1409,11 +1466,24 @@ pub struct AppState {
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
     pub rename_pane_target: Option<PaneId>,
+    /// When set, the rename-workspace input edits this workspace's tag, not its name.
+    pub tag_edit_target: Option<usize>,
+    /// When set, the rename-workspace input renames this tag across every workspace
+    /// that carries it, rather than editing a single workspace's tag.
+    pub tag_rename_from: Option<String>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
     pub worktree_directory: std::path::PathBuf,
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Explicit per-tag-name color override, keyed by tag name, valued by a
+    /// `TagAccent` id (accent/teal/green/yellow/mauve). Absent tags fall back to
+    /// the stable-hash default. Migrated on tag rename like the collapse key.
+    pub tag_colors: std::collections::HashMap<String, String>,
+    /// Manual display order of tag groups, by tag name. Tags absent from this list
+    /// sort after the listed ones in first-appearance order. Drives the `Manual`
+    /// tag sort mode; migrated on tag rename.
+    pub tag_order: Vec<String>,
     pub request_complete_onboarding: bool,
     pub name_input: String,
     pub name_input_replace_on_type: bool,
@@ -1774,6 +1844,7 @@ impl AppState {
             previous_pane_focus: None,
             selected: 0,
             mode: Mode::Navigate,
+            prefix_which_key_expanded: false,
             should_quit: false,
             detach_exits: false,
             detach_requested: false,
@@ -1793,11 +1864,15 @@ impl AppState {
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
+            tag_edit_target: None,
+            tag_rename_from: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
             worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -2238,7 +2313,7 @@ impl AppState {
         }
         if let Some(menu) = &self.context_menu {
             match menu.kind {
-                ContextMenuKind::Workspace { ws_idx }
+                ContextMenuKind::Workspace { ws_idx, .. }
                 | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
                     assert_workspace_index(ws_idx, "context menu workspace")
                 }
@@ -2266,6 +2341,9 @@ impl AppState {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
                 }
+                // Tag menus key off the tag name, not a workspace index, so there
+                // is no index to validate here.
+                ContextMenuKind::TagHeader { .. } | ContextMenuKind::TagColor { .. } => {}
             }
         }
     }
@@ -2620,5 +2698,78 @@ mod tests {
                 "Collapse"
             ]
         );
+    }
+
+    #[test]
+    fn untagged_workspace_context_menu_offers_tag_but_not_remove_tag() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        let items = menu.items();
+        assert!(items.contains(&"Tag..."));
+        assert!(!items.contains(&"Remove tag"));
+        assert!(items.contains(&"Rename"));
+        assert!(items.contains(&"Close"));
+    }
+
+    #[test]
+    fn tagged_workspace_context_menu_offers_remove_tag() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        let items = menu.items();
+        assert!(items.contains(&"Tag..."));
+        assert!(items.contains(&"Remove tag"));
+    }
+
+    #[test]
+    fn tagged_workspace_context_menu_places_rename_tag_between_tag_and_remove() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        let items = menu.items();
+        let tag = items.iter().position(|item| *item == "Tag...").unwrap();
+        let rename = items
+            .iter()
+            .position(|item| *item == "Rename tag...")
+            .unwrap();
+        let remove = items.iter().position(|item| *item == "Remove tag").unwrap();
+        assert!(tag < rename && rename < remove);
+    }
+
+    #[test]
+    fn untagged_workspace_context_menu_hides_rename_tag() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Workspace {
+                ws_idx: 0,
+                has_tag: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert!(!menu.items().contains(&"Rename tag..."));
     }
 }

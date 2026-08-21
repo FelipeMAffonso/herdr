@@ -44,10 +44,16 @@ const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+/// How long the prefix chord is held (with no follow-up key) before the which-key
+/// popup expands from the slim hint bar into the full binding list.
+const PREFIX_WHICH_KEY_DELAY: Duration = Duration::from_millis(600);
 const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
+/// Redraw cadence for the sidebar's animated working spinner and the waiting
+/// counters. Re-arms only while an agent is working or needs attention.
+const SIDEBAR_ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -130,6 +136,14 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
+    /// When set, the next instant the sidebar working spinner / waiting counters
+    /// should re-render. Armed on a pane state change, re-armed while any agent is
+    /// working or needs attention, cleared to `None` when nothing needs animating.
+    pub(crate) next_sidebar_animation: Option<Instant>,
+    /// When set, the instant the prefix which-key popup should expand from the slim
+    /// hint bar into the full binding list. Armed on entering `Mode::Prefix`, cleared
+    /// to `None` when prefix mode is left or the popup has already expanded.
+    pub(crate) prefix_which_key_deadline: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -402,6 +416,8 @@ impl App {
             sidebar_width_source,
             sidebar_section_split,
             collapsed_space_keys,
+            tag_colors,
+            tag_order,
         ) = if no_session {
             (
                 Vec::new(),
@@ -411,6 +427,8 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
             )
         } else if let Some(snap) = crate::persist::load() {
             let history = config
@@ -447,6 +465,8 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.tag_colors,
+                    snap.tag_order,
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
@@ -464,6 +484,8 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.tag_colors,
+                    snap.tag_order,
                 )
             }
         } else {
@@ -475,6 +497,8 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
             )
         };
 
@@ -543,6 +567,7 @@ impl App {
             previous_pane_focus: None,
             selected,
             mode,
+            prefix_which_key_expanded: false,
             should_quit: false,
             detach_exits: no_session,
             detach_requested: false,
@@ -562,11 +587,15 @@ impl App {
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
             rename_pane_target: None,
+            tag_edit_target: None,
+            tag_rename_from: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
             worktree_directory,
             collapsed_space_keys,
+            tag_colors,
+            tag_order,
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -765,6 +794,8 @@ impl App {
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
+            next_sidebar_animation: None,
+            prefix_which_key_deadline: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -865,6 +896,8 @@ impl App {
             app.state.sidebar_section_split = split;
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        app.state.tag_colors = snapshot.tag_colors.clone();
+        app.state.tag_order = snapshot.tag_order.clone();
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -893,7 +926,45 @@ impl App {
         self.full_redraw_pending = true;
     }
 
+    /// Arm or clear the which-key popup deadline as prefix mode is entered or left.
+    /// Called from the same choke points as `sync_prefix_input_source`, so every
+    /// path that changes the mode keeps the popup timing consistent. Entering prefix
+    /// arms the delay and starts collapsed; leaving prefix clears both the deadline
+    /// and the expanded flag so the next entry starts fresh.
+    pub(crate) fn sync_prefix_which_key(&mut self, previous_mode: Mode) {
+        let now = Instant::now();
+        match (previous_mode, self.state.mode) {
+            (before, Mode::Prefix) if before != Mode::Prefix => {
+                self.state.prefix_which_key_expanded = false;
+                self.prefix_which_key_deadline = Some(now + PREFIX_WHICH_KEY_DELAY);
+            }
+            (Mode::Prefix, after) if after != Mode::Prefix => {
+                self.state.prefix_which_key_expanded = false;
+                self.prefix_which_key_deadline = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// When the which-key delay has elapsed while still in prefix mode, expand the
+    /// popup and request a redraw. Returns true when a redraw is needed.
+    pub(crate) fn expire_prefix_which_key(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.prefix_which_key_deadline else {
+            return false;
+        };
+        if now < deadline {
+            return false;
+        }
+        self.prefix_which_key_deadline = None;
+        if self.state.mode == Mode::Prefix && !self.state.prefix_which_key_expanded {
+            self.state.prefix_which_key_expanded = true;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn sync_prefix_input_source(&mut self, previous_mode: Mode) {
+        self.sync_prefix_which_key(previous_mode);
         // Emit the input-source intent on entering/leaving the ASCII realm, like `ClipboardWrite`;
         // the foreground (client, or this app in monolithic mode) applies the switch. Keyed on the
         // realm so multi-level prefix commands stay ASCII. The switch is flag-gated but the restore
@@ -4931,6 +5002,127 @@ mod tests {
         );
     }
 
+    /// Give the workspace's root pane the given detected state so aggregate_state
+    /// resolves to it.
+    fn set_root_pane_state(app: &mut App, state: AgentState, seen: bool) {
+        let root_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal_id).unwrap().state = state;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&root_pane)
+            .unwrap()
+            .seen = seen;
+    }
+
+    #[test]
+    fn sidebar_animation_active_tracks_working_and_attention() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+
+        set_root_pane_state(&mut app, AgentState::Idle, true);
+        assert!(!app.sidebar_animation_active());
+
+        set_root_pane_state(&mut app, AgentState::Working, true);
+        assert!(app.sidebar_animation_active());
+
+        // Done-and-unseen still needs the waiting counters to refresh.
+        set_root_pane_state(&mut app, AgentState::Idle, false);
+        assert!(app.sidebar_animation_active());
+
+        set_root_pane_state(&mut app, AgentState::Blocked, true);
+        assert!(app.sidebar_animation_active());
+    }
+
+    #[test]
+    fn next_loop_deadline_includes_sidebar_animation() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.next_sidebar_animation = Some(now + Duration::from_millis(50));
+        app.next_resize_poll = now + Duration::from_secs(5);
+        app.session_save_deadline = Some(now + Duration::from_secs(2));
+
+        assert_eq!(
+            app.next_loop_deadline(now, false),
+            app.next_sidebar_animation
+        );
+    }
+
+    #[test]
+    fn due_sidebar_animation_rearms_while_working_and_clears_when_idle() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+        set_root_pane_state(&mut app, AgentState::Working, true);
+
+        let now = Instant::now();
+        app.next_sidebar_animation = Some(now - Duration::from_millis(1));
+        assert!(app.handle_scheduled_tasks(now, false));
+        // Still working: the timer re-arms into the future.
+        let rearmed = app.next_sidebar_animation.expect("re-armed while working");
+        assert!(rearmed > now);
+
+        // Nothing to animate: the next firing clears the timer entirely.
+        set_root_pane_state(&mut app, AgentState::Idle, true);
+        let later = rearmed;
+        app.next_sidebar_animation = Some(later - Duration::from_millis(1));
+        app.handle_scheduled_tasks(later, false);
+        assert!(app.next_sidebar_animation.is_none());
+    }
+
+    #[test]
+    fn prefix_which_key_arms_on_entry_and_expands_when_delay_elapses() {
+        let mut app = test_app();
+        let now = Instant::now();
+
+        // Entering prefix mode arms the delay and starts collapsed.
+        app.state.mode = Mode::Prefix;
+        app.sync_prefix_which_key(Mode::Terminal);
+        assert!(!app.state.prefix_which_key_expanded);
+        let deadline = app
+            .prefix_which_key_deadline
+            .expect("which-key deadline armed on prefix entry");
+        // The headless variant excludes the resize poll and git refresh, leaving the
+        // which-key deadline as the only pending wake-up in a fresh test app.
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(deadline)
+        );
+
+        // Before the delay, nothing changes.
+        assert!(!app.expire_prefix_which_key(deadline - Duration::from_millis(1)));
+        assert!(!app.state.prefix_which_key_expanded);
+
+        // Once the delay elapses the popup expands and the deadline clears.
+        assert!(app.expire_prefix_which_key(deadline));
+        assert!(app.state.prefix_which_key_expanded);
+        assert!(app.prefix_which_key_deadline.is_none());
+
+        // Leaving prefix mode resets the popup so the next entry starts fresh.
+        app.state.mode = Mode::Terminal;
+        app.sync_prefix_which_key(Mode::Prefix);
+        assert!(!app.state.prefix_which_key_expanded);
+        assert!(app.prefix_which_key_deadline.is_none());
+    }
+
+    #[test]
+    fn arm_sidebar_animation_is_a_no_op_when_nothing_animates() {
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.ensure_test_terminals();
+        set_root_pane_state(&mut app, AgentState::Idle, true);
+
+        app.arm_sidebar_animation(Instant::now());
+        assert!(app.next_sidebar_animation.is_none());
+
+        set_root_pane_state(&mut app, AgentState::Working, true);
+        app.arm_sidebar_animation(Instant::now());
+        assert!(app.next_sidebar_animation.is_some());
+    }
+
     #[test]
     fn headless_next_loop_deadline_ignores_resize_poll() {
         let mut app = test_app();
@@ -6146,12 +6338,23 @@ last_pane = "prefix+tab"
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.confirm_close = false;
-        app.state.context_menu = Some(state::ContextMenuState {
-            kind: state::ContextMenuKind::Workspace { ws_idx: 1 },
+        let mut menu = state::ContextMenuState {
+            kind: state::ContextMenuKind::Workspace {
+                ws_idx: 1,
+                has_tag: false,
+            },
             x: 2,
             y: 2,
-            list: state::MenuListState::new(1),
-        });
+            list: state::MenuListState::new(0),
+        };
+        // Select "Close" by label so menu growth cannot shift the target.
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("workspace menu should carry Close");
+        menu.list = state::MenuListState::new(close_idx);
+        app.state.context_menu = Some(menu);
         app.state.mode = Mode::ContextMenu;
 
         app.route_client_input(b"\r".to_vec());

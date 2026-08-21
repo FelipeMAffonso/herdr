@@ -1292,6 +1292,8 @@ impl HeadlessServer {
             self.app.state.sidebar_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
+            self.app.state.tag_colors.clone(),
+            self.app.state.tag_order.clone(),
         );
 
         let mut handoff_entries = Vec::new();
@@ -4718,6 +4720,21 @@ impl HeadlessServer {
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
 
+        // The server renders frames for attached clients through this loop, so the
+        // sidebar spinner only turns if the headless path drives its timer just
+        // like the interactive `App::handle_scheduled_tasks` does. Arm first (a
+        // no-op unless work is active and the timer is idle) so a session restore
+        // or a fresh client attach that left the timer cleared still gets a tick,
+        // then fire it: a fired tick marks the frame dirty for clients below.
+        self.app.arm_sidebar_animation(now);
+        if self.app.tick_sidebar_animation(now) {
+            changed = true;
+        }
+
+        if self.app.expire_prefix_which_key(now) {
+            changed = true;
+        }
+
         if self
             .app
             .config_diagnostic_deadline
@@ -7464,6 +7481,96 @@ next_tab = ""
 
         assert!(!server.handle_scheduled_tasks_headless(now, false));
         assert_eq!(server.app.next_agent_manifest_update_check, None);
+    }
+
+    /// Put the workspace's root pane's attached terminal into `state` so
+    /// `aggregate_state` (and thus `sidebar_animation_active`) resolves to it.
+    fn set_headless_root_pane_state(server: &mut HeadlessServer, state: crate::detect::AgentState) {
+        let root_pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&root_pane]
+            .attached_terminal_id
+            .clone();
+        server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal should exist")
+            .state = state;
+    }
+
+    #[test]
+    fn headless_deadline_includes_sidebar_animation_when_armed() {
+        // The server renders for attached clients through the headless loop, so
+        // the animation timer must join the headless deadline min-set or the loop
+        // never wakes for the spinner tick.
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        server.app.next_sidebar_animation = Some(now + Duration::from_millis(50));
+
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            server.app.next_sidebar_animation
+        );
+    }
+
+    #[test]
+    fn headless_scheduled_tasks_tick_sidebar_animation_rearms_while_working_and_clears_when_idle() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("restored")];
+        server.app.state.ensure_test_terminals();
+        set_headless_root_pane_state(&mut server, crate::detect::AgentState::Working);
+
+        let now = Instant::now();
+        server.app.next_sidebar_animation = Some(now - Duration::from_millis(1));
+        // A due tick fires: it forces a redraw for attached clients and re-arms
+        // the timer into the future while the pane is still working.
+        assert!(server.handle_scheduled_tasks_headless(now, false));
+        let rearmed = server
+            .app
+            .next_sidebar_animation
+            .expect("re-armed while working");
+        assert!(rearmed > now);
+
+        // Once nothing is animating, the next firing clears the timer entirely.
+        set_headless_root_pane_state(&mut server, crate::detect::AgentState::Idle);
+        server.app.next_sidebar_animation = Some(rearmed - Duration::from_millis(1));
+        server.handle_scheduled_tasks_headless(rearmed, false);
+        assert!(server.app.next_sidebar_animation.is_none());
+    }
+
+    #[test]
+    fn headless_scheduled_tasks_arm_sidebar_animation_for_restored_working_pane() {
+        // A session restore (or a fresh client attach) can leave a working pane
+        // with the animation timer still cleared, because it armed only from a
+        // pane-state emit that never re-fires. The headless scheduled-tasks pass
+        // self-heals by arming and immediately firing the tick.
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("restored")];
+        server.app.state.ensure_test_terminals();
+        set_headless_root_pane_state(&mut server, crate::detect::AgentState::Working);
+        assert!(server.app.next_sidebar_animation.is_none());
+
+        let now = Instant::now();
+        assert!(server.handle_scheduled_tasks_headless(now, false));
+        let armed = server
+            .app
+            .next_sidebar_animation
+            .expect("armed and re-armed for the working pane");
+        assert!(armed > now);
+    }
+
+    #[test]
+    fn headless_scheduled_tasks_do_not_arm_sidebar_animation_when_idle() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("restored")];
+        server.app.state.ensure_test_terminals();
+        set_headless_root_pane_state(&mut server, crate::detect::AgentState::Idle);
+
+        assert!(!server.handle_scheduled_tasks_headless(Instant::now(), false));
+        assert!(server.app.next_sidebar_animation.is_none());
     }
 
     #[tokio::test]

@@ -410,6 +410,7 @@ fn restore_workspace(
         Some(Workspace {
             id: workspace_id,
             custom_name: snap.custom_name.clone(),
+            tag: snap.tag.clone(),
             identity_cwd: snap.identity_cwd.clone(),
             cached_identity_cwd: snap.identity_cwd.clone(),
             cached_auto_label,
@@ -1175,6 +1176,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
                 custom_name: None,
+                tag: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
@@ -1211,6 +1213,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            tag_colors: Default::default(),
+            tag_order: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1255,6 +1259,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("w1".into()),
                 custom_name: None,
+                tag: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(10, 1), (20, 3)]),
@@ -1304,6 +1309,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            tag_colors: Default::default(),
+            tag_order: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1364,6 +1371,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("w1".into()),
                 custom_name: None,
+                tag: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(10, 1), (11, 2), (12, 3), (13, 4)]),
@@ -1411,6 +1419,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            tag_colors: Default::default(),
+            tag_order: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1447,6 +1457,7 @@ mod tests {
         let snapshot = WorkspaceSnapshot {
             id: Some("w1".into()),
             custom_name: None,
+            tag: None,
             identity_cwd: cwd,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
@@ -1486,6 +1497,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
                 custom_name: None,
+                tag: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
@@ -1522,6 +1534,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            tag_colors: Default::default(),
+            tag_order: Default::default(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1695,6 +1709,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("workspace".into()),
                 custom_name: None,
+                tag: None,
                 identity_cwd: cwd,
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
@@ -1716,6 +1731,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            tag_colors: Default::default(),
+            tag_order: Default::default(),
         };
         (snapshot, history)
     }

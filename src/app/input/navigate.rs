@@ -100,6 +100,16 @@ impl App {
             return;
         }
 
+        // An unbound key is the which-key reveal trigger: instead of silently
+        // dropping out of prefix mode, expand the popup so the user can see every
+        // continuation. Esc or the prefix key still exit. Cancel the pending delay
+        // since the popup is now showing.
+        if !self.state.prefix_which_key_expanded {
+            self.state.prefix_which_key_expanded = true;
+            self.prefix_which_key_deadline = None;
+            return;
+        }
+
         leave_command_mode(&mut self.state);
     }
 
@@ -3164,6 +3174,34 @@ command = "printf literal > '{}'"
     }
 
     #[tokio::test]
+    async fn unbound_prefix_key_reveals_which_key_popup_instead_of_leaving() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Prefix;
+
+        // 'y' is not bound as a prefix continuation in the defaults.
+        app.handle_prefix_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()));
+
+        // First unbound key expands the popup and stays in prefix mode.
+        assert_eq!(app.state.mode, Mode::Prefix);
+        assert!(app.state.prefix_which_key_expanded);
+        assert!(app.prefix_which_key_deadline.is_none());
+
+        // A second unbound key, popup already shown, leaves prefix mode.
+        app.handle_prefix_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
     async fn legacy_uppercase_prefers_shifted_pane_binding_over_unshifted() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -3329,9 +3367,15 @@ navigate_pane_down = "ctrl+j"
             app.state.prefix_mods,
         ))
         .await;
+        // First unmatched key reveals the which-key popup and stays in prefix
+        // mode; a second unmatched key exits.
         app.handle_key(TerminalKey::new(KeyCode::F(12), KeyModifiers::empty()))
             .await;
+        assert_eq!(app.state.mode, Mode::Prefix);
+        assert!(app.state.prefix_which_key_expanded);
 
+        app.handle_key(TerminalKey::new(KeyCode::F(12), KeyModifiers::empty()))
+            .await;
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 

@@ -76,15 +76,17 @@ pub(crate) use self::{
         SETTINGS_POPUP_WIDTH,
     },
     sidebar::{
-        agent_entry_gap, agent_entry_height_in_body, agent_panel_body_rect, agent_panel_entries,
+        agent_display_row_gap, agent_display_row_height, agent_panel_body_rect,
+        agent_panel_display_row_for_entry, agent_panel_display_rows, agent_panel_entries,
         agent_panel_scroll_for_target, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
-        agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
-        collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
-        workspace_drop_slots, workspace_group_chevron_rect, workspace_list_entries,
+        agent_panel_toggle_rect, agent_tag_collapse_key, all_agent_panel_entries,
+        collapsed_sidebar_sections, collapsed_sidebar_toggle_rect, compute_workspace_card_areas,
+        expanded_sidebar_sections, expanded_sidebar_toggle_rect, normalized_workspace_scroll,
+        ordered_tag_names, sidebar_section_divider_rect, tag_collapse_key, workspace_display_order,
+        workspace_display_row_index, workspace_drop_slots, workspace_group_chevron_rect,
         workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
         workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        WorkspaceListEntry,
+        AgentPanelRow, TagAccent, WorkspaceListEntry,
     },
 };
 
@@ -595,7 +597,7 @@ fn _build_hints(items: &[(&str, &str)], key_style: Style, dim_style: Style) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::keybind_help::keybind_help_groups;
+    use super::keybind_help::{keybind_help_groups, prefix_which_key_groups};
     use super::scrollbar::scrollbar_thumb;
     use super::*;
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
@@ -1522,6 +1524,112 @@ mod tests {
             .join("");
         assert!(rendered_help.contains("open lazygit"));
         assert!(rendered_help.contains("custom command"));
+    }
+
+    #[test]
+    fn prefix_which_key_lists_custom_command_with_its_description() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("f"),
+            label: "prefix+f".to_string(),
+            command: "fzf".to_string(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: Some("fuzzy find".to_string()),
+            width: None,
+            height: None,
+        }];
+
+        let groups = prefix_which_key_groups(&app);
+
+        // The custom command shows its bare continuation chord and configured description.
+        let custom = groups
+            .iter()
+            .find(|(name, _)| *name == "custom")
+            .expect("custom group present")
+            .1
+            .clone();
+        assert!(custom
+            .iter()
+            .any(|(chord, description)| chord == "f" && description.as_ref() == "fuzzy find"));
+
+        // The user's custom bindings lead the list so they survive a small terminal.
+        assert_eq!(groups.first().map(|(name, _)| *name), Some("custom"));
+
+        // A built-in prefix binding shows its bare RHS (e.g. split vertical), never
+        // the "prefix+" form; indexed prefix bindings compact to their range; and
+        // direct-only navigation keys are excluded.
+        let all: Vec<_> = groups
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .collect();
+        assert!(all
+            .iter()
+            .any(|(chord, description)| chord == "v" && description.as_ref() == "split vertical"));
+        assert!(all.iter().any(
+            |(chord, description)| chord == "1..9" && description.as_ref() == "switch tab 1-9"
+        ));
+        assert!(all.iter().all(|(chord, _)| !chord.contains("prefix+")));
+    }
+
+    fn which_key_test_app() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Prefix;
+        app.prefix_which_key_expanded = true;
+        app.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::prefix("f"),
+            label: "prefix+f".to_string(),
+            command: "fzf".to_string(),
+            action: crate::config::CustomCommandAction::Popup,
+            description: Some("fuzzy find".to_string()),
+            width: None,
+            height: None,
+        }];
+        app
+    }
+
+    fn render_which_key_to_text(app: &crate::app::state::AppState, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+            .expect("test terminal");
+        terminal
+            .draw(|frame| render_prefix_overlay(app, frame, app.view.terminal_area))
+            .expect("draw which-key popup");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn prefix_which_key_popup_lists_bindings_within_terminal_bounds() {
+        let mut app = which_key_test_app();
+        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+
+        let rendered = render_which_key_to_text(&app, 100, 30);
+
+        // The popup titles itself and lists built-ins and the custom command's
+        // description, all inside the frame (an out-of-bounds write would have
+        // panicked the draw).
+        assert!(rendered.contains("prefix"));
+        assert!(rendered.contains("split vertical"));
+        assert!(rendered.contains("swap pane left"));
+        assert!(rendered.contains("fuzzy find"));
+    }
+
+    #[test]
+    fn prefix_which_key_popup_survives_tiny_frame_with_more_marker() {
+        let mut app = which_key_test_app();
+        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 40, 8);
+
+        let rendered = render_which_key_to_text(&app, 40, 8);
+
+        // Too small for the whole list: the custom binding still leads, and the
+        // cut is announced instead of silent.
+        assert!(rendered.contains("prefix"));
+        assert!(rendered.contains("fuzzy find"));
+        assert!(rendered.contains("more"));
     }
 
     #[test]

@@ -193,19 +193,35 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     }
 }
 
+/// Braille spinner frames, the same animation the boards use. Every frame is
+/// display-width 1, so the icon column never shifts as it animates.
+pub(super) const WORKING_SPINNER_FRAMES: [&str; 10] =
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Current spinner frame from the wall clock, advancing one step every 80ms.
+fn working_spinner_frame() -> &'static str {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let index = ((millis / 80) % WORKING_SPINNER_FRAMES.len() as u128) as usize;
+    WORKING_SPINNER_FRAMES[index]
+}
+
 pub(super) fn state_icon_symbol(
     state: AgentState,
     seen: bool,
     indicator_style: StatusIndicatorStyle,
 ) -> &'static str {
     match (indicator_style, state, seen) {
+        // Working animates in both styles: the braille spinner reads as motion,
+        // which a static glyph never does.
+        (_, AgentState::Working, _) => working_spinner_frame(),
         (StatusIndicatorStyle::Dots, AgentState::Blocked, _) => "●",
-        (StatusIndicatorStyle::Dots, AgentState::Working, _) => "●",
         (StatusIndicatorStyle::Dots, AgentState::Idle, false) => "●",
         (StatusIndicatorStyle::Dots, AgentState::Idle, true) => "○",
         (StatusIndicatorStyle::Dots, AgentState::Unknown, _) => "·",
         (StatusIndicatorStyle::Symbols, AgentState::Blocked, _) => "×",
-        (StatusIndicatorStyle::Symbols, AgentState::Working, _) => "◐",
         (StatusIndicatorStyle::Symbols, AgentState::Idle, false) => "✓",
         (StatusIndicatorStyle::Symbols, AgentState::Idle, true) => "○",
         (StatusIndicatorStyle::Symbols, AgentState::Unknown, _) => "·",
@@ -268,13 +284,14 @@ mod tests {
     #[test]
     fn state_icons_support_dot_and_distinct_symbol_styles() {
         let palette = Palette::catppuccin();
+        // Working now animates through the braille spinner, so its symbol is
+        // asserted by width + frame membership below rather than an exact glyph.
         for (indicator_style, expected_symbols) in [
-            (StatusIndicatorStyle::Dots, ["●", "●", "●", "○", "·"]),
-            (StatusIndicatorStyle::Symbols, ["×", "◐", "✓", "○", "·"]),
+            (StatusIndicatorStyle::Dots, ["●", "●", "○", "·"]),
+            (StatusIndicatorStyle::Symbols, ["×", "✓", "○", "·"]),
         ] {
             for ((state, seen, color), expected_symbol) in [
                 (AgentState::Blocked, true, palette.red),
-                (AgentState::Working, true, palette.yellow),
                 (AgentState::Idle, false, palette.teal),
                 (AgentState::Idle, true, palette.green),
                 (AgentState::Unknown, true, palette.overlay0),
@@ -287,6 +304,21 @@ mod tests {
                 assert_eq!(display_width_u16(actual_symbol), 1);
                 assert_eq!(style.fg, Some(color));
             }
+
+            // Working: a spinner frame (width 1, drawn from the frame set), colored
+            // as the working state.
+            let (working_symbol, working_style) =
+                state_icon(AgentState::Working, true, indicator_style, &palette);
+            assert_eq!(display_width_u16(working_symbol), 1);
+            assert!(WORKING_SPINNER_FRAMES.contains(&working_symbol));
+            assert_eq!(working_style.fg, Some(palette.yellow));
+        }
+    }
+
+    #[test]
+    fn working_spinner_frames_are_all_width_one() {
+        for frame in WORKING_SPINNER_FRAMES {
+            assert_eq!(display_width_u16(frame), 1);
         }
     }
 

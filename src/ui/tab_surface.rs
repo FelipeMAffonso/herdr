@@ -250,10 +250,30 @@ mod tests {
         )
     }
 
+    /// Collapse any working-spinner cell to the first frame before digesting.
+    ///
+    /// The sidebar's working glyph advances off the wall clock (`status.rs`
+    /// `working_spinner_frame`), so a frame that contains a working pane would
+    /// otherwise hash differently on every run. Mapping every one of the ten
+    /// braille frames to a single canonical glyph keeps the characterization
+    /// deterministic without freezing the clock in production or weakening any
+    /// other cell of the frame.
+    fn normalize_spinner_cells(frame: &crate::protocol::FrameData) -> crate::protocol::FrameData {
+        let canonical = crate::ui::status::WORKING_SPINNER_FRAMES[0];
+        let mut frame = frame.clone();
+        for cell in &mut frame.cells {
+            if crate::ui::status::WORKING_SPINNER_FRAMES.contains(&cell.symbol.as_str()) {
+                cell.symbol = canonical.to_owned();
+            }
+        }
+        frame
+    }
+
     fn frame_digest(frame: &crate::protocol::FrameData) -> String {
         use sha2::{Digest, Sha256};
 
-        let encoded = bincode::serde::encode_to_vec(frame, bincode::config::standard()).unwrap();
+        let frame = normalize_spinner_cells(frame);
+        let encoded = bincode::serde::encode_to_vec(&frame, bincode::config::standard()).unwrap();
         format!("{:x}", Sha256::digest(encoded))
     }
 
@@ -304,7 +324,7 @@ mod tests {
         assert_eq!(frame.hyperlinks, vec![uri.to_owned()]);
         assert_eq!(
             frame_digest(&frame),
-            "a7c21fa42305a41231c7ae254f264f6ef923f46301d8fc4cd35ab6dfdd651b6b"
+            "d4f5746eebfc7dd335b6a5673fa69d6246b7baba0c60960a9a65316cf3651877"
         );
     }
 

@@ -26,6 +26,14 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Per-tag-name color override (tag name -> `TagAccent` id). Empty by default,
+    /// so an old snapshot restores every tag on its stable-hash default.
+    #[serde(default)]
+    pub tag_colors: HashMap<String, String>,
+    /// Manual tag-group display order by tag name. Empty by default, which the
+    /// spaces list reads as first-appearance order.
+    #[serde(default)]
+    pub tag_order: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +60,8 @@ pub struct WorkspaceSnapshot {
     pub id: Option<String>,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -156,6 +166,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         Self {
             id: None,
             custom_name: snap.custom_name,
+            tag: None,
             identity_cwd,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
@@ -184,6 +195,10 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    tag_colors: HashMap<String, String>,
+    #[serde(default)]
+    tag_order: Vec<String>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -199,6 +214,8 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        tag_colors: raw.tag_colors,
+        tag_order: raw.tag_order,
     })
 }
 
@@ -261,6 +278,8 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    tag_colors: HashMap<String, String>,
+    tag_order: Vec<String>,
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -273,6 +292,8 @@ pub fn capture(
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        tag_colors,
+        tag_order,
     }
 }
 
@@ -287,6 +308,7 @@ fn capture_workspace(
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
+        tag: ws.tag.clone(),
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
@@ -541,6 +563,8 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            state.tag_colors.clone(),
+            state.tag_order.clone(),
         )
     }
 
@@ -605,6 +629,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -666,6 +692,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
+                tag: Some("research".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
                 public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
@@ -692,6 +719,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -704,6 +733,7 @@ mod tests {
             restored.workspaces[0].custom_name.as_deref(),
             Some("pi-mono")
         );
+        assert_eq!(restored.workspaces[0].tag.as_deref(), Some("research"));
         assert_eq!(restored.workspaces[0].tabs.len(), 1);
         assert_eq!(restored.workspaces[0].tabs[0].panes.len(), 2);
         assert_eq!(
@@ -849,6 +879,78 @@ mod tests {
         assert_eq!(workspace.active_tab, second_tab);
         assert_eq!(workspace.tabs[0].custom_name.as_deref(), Some("main"));
         assert_eq!(workspace.tabs[1].custom_name.as_deref(), Some("logs"));
+    }
+
+    #[test]
+    fn capture_and_parse_round_trip_workspace_tag() {
+        let mut state = state_with_workspaces(&["one"]);
+        state.workspaces[0].set_tag(Some("teaching".into()));
+
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(restored.workspaces[0].tag.as_deref(), Some("teaching"));
+    }
+
+    #[test]
+    fn capture_and_parse_round_trip_tag_colors_and_order() {
+        let mut state = state_with_workspaces(&["one"]);
+        state.tag_colors.insert("research".into(), "mauve".into());
+        state.tag_order = vec!["research".into(), "teaching".into()];
+
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(
+            restored.tag_colors.get("research").map(String::as_str),
+            Some("mauve")
+        );
+        assert_eq!(
+            restored.tag_order,
+            vec!["research".to_string(), "teaching".to_string()]
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_tag_colors_or_order_defaults_empty() {
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [],
+            "active": null,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert!(restored.tag_colors.is_empty());
+        assert!(restored.tag_order.is_empty());
+    }
+
+    #[test]
+    fn old_snapshot_without_tag_defaults_to_none() {
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [{
+                "id": "wtest",
+                "identity_cwd": "/tmp",
+                "tabs": [{
+                    "layout": { "Pane": 0 },
+                    "panes": { "0": { "cwd": "/tmp" } },
+                    "zoomed": false,
+                    "focused": 0,
+                    "root_pane": 0
+                }],
+                "active_tab": 0
+            }],
+            "active": 0,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(restored.workspaces[0].tag, None);
     }
 
     #[test]
@@ -1228,6 +1330,7 @@ mod tests {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
+                tag: None,
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
                 public_pane_numbers: HashMap::new(),
@@ -1254,6 +1357,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

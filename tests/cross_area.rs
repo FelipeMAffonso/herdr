@@ -579,11 +579,44 @@ fn frame_contains_text(frame: &FrameWire, needle: &str) -> bool {
     text.contains(needle)
 }
 
+/// Fill `buf` exactly, tolerating read timeouts mid-buffer. A plain `read_exact`
+/// on a stream with a read timeout discards the bytes it already consumed when the
+/// timeout fires part-way through, desyncing the length-prefixed frame stream: the
+/// next read then interprets frame-body bytes as a length prefix. This retries into
+/// the same buffer across timeout slices until `buf` is full or the overall
+/// `deadline` passes, so a frame split across a timeout boundary never desyncs the
+/// reader. Returns `TimedOut` if the buffer could not be filled before the deadline.
+fn read_exact_until(stream: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "deadline elapsed before frame was fully read",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining.min(Duration::from_millis(80))))?;
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream closed mid-frame",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(err) if is_timeout(&err) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn read_server_variant(stream: &mut UnixStream, timeout: Duration) -> io::Result<u32> {
-    stream.set_read_timeout(Some(timeout))?;
+    let deadline = Instant::now() + timeout;
 
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
+    read_exact_until(stream, &mut len_buf, deadline)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len == 0 {
         return Err(io::Error::new(
@@ -593,7 +626,7 @@ fn read_server_variant(stream: &mut UnixStream, timeout: Duration) -> io::Result
     }
 
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
+    read_exact_until(stream, &mut payload, deadline)?;
 
     let (variant, _consumed) = decode_varint_u32(&payload, 0)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -604,10 +637,10 @@ fn read_server_message_payload(
     stream: &mut UnixStream,
     timeout: Duration,
 ) -> io::Result<(u32, Vec<u8>)> {
-    stream.set_read_timeout(Some(timeout))?;
+    let deadline = Instant::now() + timeout;
 
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
+    read_exact_until(stream, &mut len_buf, deadline)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len == 0 {
         return Err(io::Error::new(
@@ -617,7 +650,7 @@ fn read_server_message_payload(
     }
 
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
+    read_exact_until(stream, &mut payload, deadline)?;
 
     let (variant, consumed) = decode_varint_u32(&payload, 0)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -843,9 +876,14 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     // Reattach and ensure client-side state reflects the persisted working status.
     let mut client_b = UnixStream::connect(&client_socket).expect("client B should connect");
     client_handshake(&mut client_b, CURRENT_PROTOCOL, 80, 24);
+    // Working renders as an animated braille spinner now, so any frame glyph in
+    // the working color proves the persisted status reached the client.
+    const WORKING_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let saw_working_on_client =
         wait_for_frame_matching(&mut client_b, Duration::from_secs(5), |frame| {
-            frame_contains_colored_symbol(frame, "●", (249, 226, 175))
+            WORKING_SPINNER_FRAMES
+                .iter()
+                .any(|glyph| frame_contains_colored_symbol(frame, glyph, (249, 226, 175)))
         })
         .expect("frame decoding should succeed");
     assert!(
@@ -1136,4 +1174,49 @@ fn cross_area_server_kill_then_restart_and_reconnect() {
     );
 
     cleanup_spawned_herdr(server2, base);
+}
+
+#[test]
+fn framed_read_survives_a_frame_split_across_timeout_slices() {
+    // Regression for the animated-spinner flood: a plain read_exact on a stream
+    // with a read timeout discards its partial buffer when the timeout fires
+    // mid-frame, desyncing the length-prefixed stream so the next read parses
+    // frame bytes as a length prefix. read_server_message_payload must instead
+    // reassemble a frame delivered in fragments straddling the internal timeout
+    // slice (80ms) without losing sync.
+    let (mut reader, mut writer) = UnixStream::pair().expect("socket pair");
+
+    // variant 1 (Frame) as a one-byte varint, then a recognizable body.
+    let mut payload = vec![1u8];
+    payload.extend_from_slice(b"cross-area-spinner-frame-body");
+    let len_prefix = (payload.len() as u32).to_le_bytes();
+
+    let sender = thread::spawn(move || {
+        // Length prefix split, then a stall longer than the 80ms internal slice,
+        // then the body split with another stall: every gap would have desynced
+        // the old read_exact-based reader.
+        writer.write_all(&len_prefix[..2]).unwrap();
+        writer.flush().unwrap();
+        thread::sleep(Duration::from_millis(150));
+        writer.write_all(&len_prefix[2..]).unwrap();
+        writer.flush().unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let mid = payload.len() / 2;
+        writer.write_all(&payload[..mid]).unwrap();
+        writer.flush().unwrap();
+        thread::sleep(Duration::from_millis(150));
+        writer.write_all(&payload[mid..]).unwrap();
+        writer.flush().unwrap();
+    });
+
+    let (variant, body) = read_server_message_payload(&mut reader, Duration::from_secs(5))
+        .expect("fragmented frame should reassemble without desyncing");
+    sender.join().unwrap();
+
+    assert_eq!(variant, 1, "variant must decode as Frame");
+    assert_eq!(
+        body,
+        b"cross-area-spinner-frame-body".to_vec(),
+        "payload after the variant must survive the fragmented delivery intact"
+    );
 }
