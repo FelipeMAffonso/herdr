@@ -86,7 +86,7 @@ pub(crate) use self::{
         workspace_display_row_index, workspace_drop_slots, workspace_group_chevron_rect,
         workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
         workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        AgentPanelRow, TagAccent, TagLayoutRow, WorkspaceListEntry,
+        AgentPanelRow, TagAccent, WorkspaceListEntry,
     },
 };
 

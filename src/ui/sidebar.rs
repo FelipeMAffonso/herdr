@@ -429,7 +429,7 @@ pub(crate) fn sort_tag_groups(
     match mode {
         crate::config::TagSortMode::FirstAppearance => {}
         crate::config::TagSortMode::Name => {
-            groups.sort_by(|a, b| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()));
+            groups.sort_by_key(|group| group.tag.to_lowercase());
         }
         crate::config::TagSortMode::Manual => {
             let rank = |tag: &str| {
