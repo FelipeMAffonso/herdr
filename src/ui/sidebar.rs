@@ -4605,6 +4605,7 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
                 vec![crate::config::SpaceSidebarToken::Custom("usage".into())],
             ],
             row_gap: 0,
+            tag_sort: crate::config::TagSortMode::default(),
         };
         let mut ws = Workspace::test_new("repo");
         ws.cached_git_branch = Some("mainline".into());
