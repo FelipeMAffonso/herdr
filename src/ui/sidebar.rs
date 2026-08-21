@@ -416,6 +416,46 @@ pub(crate) fn group_entries_by_tag(entry_tags: &[Option<String>]) -> TagGrouping
     TagGrouping { groups, ungrouped }
 }
 
+/// Reorder tag groups in place per the sort mode. `Manual` follows `manual_order`
+/// (tags absent from it keep their first-appearance order, appended after the
+/// listed ones); `Name` sorts case-insensitively by tag name; `FirstAppearance`
+/// leaves the input order untouched. Sorting is stable, so ties (and unknown
+/// tags under `Manual`) preserve first-appearance order.
+pub(crate) fn sort_tag_groups(
+    groups: &mut [TagGroup],
+    mode: crate::config::TagSortMode,
+    manual_order: &[String],
+) {
+    match mode {
+        crate::config::TagSortMode::FirstAppearance => {}
+        crate::config::TagSortMode::Name => {
+            groups.sort_by(|a, b| a.tag.to_lowercase().cmp(&b.tag.to_lowercase()));
+        }
+        crate::config::TagSortMode::Manual => {
+            let rank = |tag: &str| {
+                manual_order
+                    .iter()
+                    .position(|listed| listed == tag)
+                    .unwrap_or(usize::MAX)
+            };
+            groups.sort_by_key(|group| rank(&group.tag));
+        }
+    }
+}
+
+/// The tag-group names in the spaces list's display order, respecting the active
+/// sort mode and manual order. Drives header-menu "is first / is last" and the
+/// move-up/down reorder. Empty when no workspace carries a tag.
+pub(crate) fn ordered_tag_names(app: &AppState) -> Vec<String> {
+    tag_layout_rows(app)
+        .into_iter()
+        .filter_map(|row| match row {
+            TagLayoutRow::Header { tag, .. } => Some(tag),
+            TagLayoutRow::Entry { .. } => None,
+        })
+        .collect()
+}
+
 pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
@@ -608,7 +648,12 @@ pub(crate) fn tag_layout_rows(app: &AppState) -> Vec<TagLayoutRow> {
         })
         .collect();
 
-    let grouping = group_entries_by_tag(&block_tags);
+    let mut grouping = group_entries_by_tag(&block_tags);
+    sort_tag_groups(
+        &mut grouping.groups,
+        app.sidebar_spaces.tag_sort,
+        &app.tag_order,
+    );
     let mut rows = Vec::new();
 
     for group in &grouping.groups {
@@ -907,7 +952,12 @@ pub(crate) fn agent_panel_display_rows(
                 .and_then(|ws| ws.tag().map(str::to_string))
         })
         .collect();
-    let grouping = group_entries_by_tag(&entry_tags);
+    let mut grouping = group_entries_by_tag(&entry_tags);
+    sort_tag_groups(
+        &mut grouping.groups,
+        app.sidebar_spaces.tag_sort,
+        &app.tag_order,
+    );
 
     let mut rows = Vec::new();
     for group in &grouping.groups {
@@ -1666,15 +1716,107 @@ fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) 
     style
 }
 
-/// Stable color for a tag, hashed from its bytes onto a small palette-derived
-/// set. `p.red` is deliberately excluded: red is reserved for broken/blocked
-/// state, so no tag ever borrows it. The same tag always maps to the same color.
-pub(crate) fn tag_color(tag: &str, p: &Palette) -> Color {
-    let palette = [p.accent, p.teal, p.green, p.yellow];
+/// A theme-accent choice a tag can be painted with. `red` is deliberately absent:
+/// red is reserved for broken/blocked state, so no tag ever borrows it. The `id()`
+/// is the stable string persisted per tag name in the session snapshot; `label()`
+/// is what the picker shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagAccent {
+    Accent,
+    Teal,
+    Green,
+    Yellow,
+    Mauve,
+}
+
+impl TagAccent {
+    /// The accents the picker offers, in menu order.
+    pub(crate) const ALL: [TagAccent; 5] = [
+        TagAccent::Accent,
+        TagAccent::Teal,
+        TagAccent::Green,
+        TagAccent::Yellow,
+        TagAccent::Mauve,
+    ];
+
+    /// Stable id persisted in the snapshot's `tag_colors` map.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            TagAccent::Accent => "accent",
+            TagAccent::Teal => "teal",
+            TagAccent::Green => "green",
+            TagAccent::Yellow => "yellow",
+            TagAccent::Mauve => "mauve",
+        }
+    }
+
+    /// Human name shown beside the swatch in the picker.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TagAccent::Accent => "Accent",
+            TagAccent::Teal => "Teal",
+            TagAccent::Green => "Green",
+            TagAccent::Yellow => "Yellow",
+            TagAccent::Mauve => "Mauve",
+        }
+    }
+
+    /// Parse a persisted id back into an accent, ignoring unknown ids so a stale
+    /// or hand-edited snapshot falls back to the stable-hash default.
+    pub(crate) fn from_id(id: &str) -> Option<TagAccent> {
+        TagAccent::ALL.into_iter().find(|accent| accent.id() == id)
+    }
+
+    /// Resolve the accent to a concrete color from the active palette.
+    pub(crate) fn color(self, p: &Palette) -> Color {
+        match self {
+            TagAccent::Accent => p.accent,
+            TagAccent::Teal => p.teal,
+            TagAccent::Green => p.green,
+            TagAccent::Yellow => p.yellow,
+            TagAccent::Mauve => p.mauve,
+        }
+    }
+}
+
+/// Stable default accent for a tag, hashed from its bytes onto the picker's set.
+/// Used when the tag has no explicit color override.
+pub(crate) fn default_tag_accent(tag: &str) -> TagAccent {
     let hash = tag.bytes().fold(0u32, |acc, byte| {
         acc.wrapping_mul(31).wrapping_add(byte as u32)
     });
-    palette[(hash as usize) % palette.len()]
+    // Only the first four accents form the hash default, matching the historical
+    // palette; `mauve` is reachable solely through an explicit pick.
+    let hashed = [
+        TagAccent::Accent,
+        TagAccent::Teal,
+        TagAccent::Green,
+        TagAccent::Yellow,
+    ];
+    hashed[(hash as usize) % hashed.len()]
+}
+
+/// Color for a tag: the explicit per-tag-name override in `overrides` when one is
+/// set (and parses to a known accent), otherwise the stable-hash default. `p.red`
+/// is never returned. The same tag always maps to the same color absent an override.
+pub(crate) fn tag_color_with_overrides(
+    tag: &str,
+    overrides: &std::collections::HashMap<String, String>,
+    p: &Palette,
+) -> Color {
+    overrides
+        .get(tag)
+        .and_then(|id| TagAccent::from_id(id))
+        .unwrap_or_else(|| default_tag_accent(tag))
+        .color(p)
+}
+
+/// Stable color for a tag with no override map available; the hash default.
+/// Only the tests need this now (production always routes through the override
+/// map), so it is gated to test builds to stay clear of dead-code warnings.
+#[cfg(test)]
+pub(crate) fn tag_color(tag: &str, p: &Palette) -> Color {
+    default_tag_accent(tag).color(p)
 }
 
 /// Leading attention edge for a tag group header: the strongest state across the
@@ -1721,7 +1863,7 @@ fn render_tag_group_header(
         .map(|ws| ws.aggregate_state(&app.terminals))
         .collect();
     let need = need_rollup(&member_states);
-    let color = tag_color(tag, p);
+    let color = tag_color_with_overrides(tag, &app.tag_colors, p);
     let collapsed = app.collapsed_space_keys.contains(&tag_collapse_key(tag));
     let chevron = if collapsed { "▸" } else { "▾" };
     let spans = vec![
@@ -1992,7 +2134,7 @@ fn render_agent_tag_group_header(
     need: Option<NeedLevel>,
 ) {
     let p = &app.palette;
-    let color = tag_color(tag, p);
+    let color = tag_color_with_overrides(tag, &app.tag_colors, p);
     let chevron = if collapsed { "▸" } else { "▾" };
     let spans = vec![
         tag_group_edge(need, p),
@@ -3978,6 +4120,153 @@ rows = [[{ token = "git_status", fg = "#123456" }]]
         ] {
             assert_ne!(tag_color(tag, &p), p.red);
         }
+    }
+
+    #[test]
+    fn tag_color_override_beats_the_hash_default() {
+        let p = Palette::catppuccin();
+        let mut overrides = std::collections::HashMap::new();
+        // "research" hashes to a non-mauve default; an explicit mauve override wins.
+        overrides.insert("research".to_string(), TagAccent::Mauve.id().to_string());
+        assert_eq!(
+            tag_color_with_overrides("research", &overrides, &p),
+            p.mauve
+        );
+        // A tag without an override keeps its stable-hash color.
+        assert_eq!(
+            tag_color_with_overrides("teaching", &overrides, &p),
+            tag_color("teaching", &p)
+        );
+    }
+
+    #[test]
+    fn tag_color_override_with_unknown_id_falls_back_to_hash_default() {
+        let p = Palette::catppuccin();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("research".to_string(), "chartreuse".to_string());
+        assert_eq!(
+            tag_color_with_overrides("research", &overrides, &p),
+            tag_color("research", &p)
+        );
+    }
+
+    #[test]
+    fn tag_accent_ids_round_trip_and_default_never_mauve() {
+        for accent in TagAccent::ALL {
+            assert_eq!(TagAccent::from_id(accent.id()), Some(accent));
+        }
+        // The hash default reaches only the historical four; mauve is pick-only.
+        for tag in ["research", "teaching", "prepara", "a", "b", "zzz", "docs"] {
+            assert_ne!(default_tag_accent(tag), TagAccent::Mauve);
+        }
+    }
+
+    #[test]
+    fn sort_tag_groups_name_orders_alphabetically_case_insensitive() {
+        let mut groups = vec![
+            TagGroup {
+                tag: "teaching".into(),
+                member_entry_indices: vec![0],
+            },
+            TagGroup {
+                tag: "Research".into(),
+                member_entry_indices: vec![1],
+            },
+            TagGroup {
+                tag: "prepara".into(),
+                member_entry_indices: vec![2],
+            },
+        ];
+        sort_tag_groups(&mut groups, crate::config::TagSortMode::Name, &[]);
+        let names: Vec<_> = groups.iter().map(|g| g.tag.as_str()).collect();
+        assert_eq!(names, vec!["prepara", "Research", "teaching"]);
+    }
+
+    #[test]
+    fn sort_tag_groups_manual_follows_order_then_first_appearance_for_unknowns() {
+        let mut groups = vec![
+            TagGroup {
+                tag: "research".into(),
+                member_entry_indices: vec![0],
+            },
+            TagGroup {
+                tag: "teaching".into(),
+                member_entry_indices: vec![1],
+            },
+            TagGroup {
+                tag: "prepara".into(),
+                member_entry_indices: vec![2],
+            },
+        ];
+        // Manual order lists teaching then prepara; research is unknown, so it keeps
+        // its first-appearance slot after the listed ones.
+        let manual = vec!["teaching".to_string(), "prepara".to_string()];
+        sort_tag_groups(&mut groups, crate::config::TagSortMode::Manual, &manual);
+        let names: Vec<_> = groups.iter().map(|g| g.tag.as_str()).collect();
+        assert_eq!(names, vec!["teaching", "prepara", "research"]);
+    }
+
+    #[test]
+    fn sort_tag_groups_first_appearance_leaves_input_order() {
+        let mut groups = vec![
+            TagGroup {
+                tag: "teaching".into(),
+                member_entry_indices: vec![0],
+            },
+            TagGroup {
+                tag: "research".into(),
+                member_entry_indices: vec![1],
+            },
+        ];
+        sort_tag_groups(
+            &mut groups,
+            crate::config::TagSortMode::FirstAppearance,
+            &["research".to_string()],
+        );
+        let names: Vec<_> = groups.iter().map(|g| g.tag.as_str()).collect();
+        assert_eq!(names, vec!["teaching", "research"]);
+    }
+
+    #[test]
+    fn tag_layout_rows_honor_manual_order_in_both_the_header_and_members() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("research")),
+            tagged_workspace("b", Some("teaching")),
+        ];
+        app.sidebar_spaces.tag_sort = crate::config::TagSortMode::Manual;
+        app.tag_order = vec!["teaching".to_string(), "research".to_string()];
+
+        let headers: Vec<_> = tag_layout_rows(&app)
+            .into_iter()
+            .filter_map(|row| match row {
+                TagLayoutRow::Header { tag, .. } => Some(tag),
+                TagLayoutRow::Entry { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec!["teaching".to_string(), "research".to_string()]
+        );
+        assert_eq!(
+            ordered_tag_names(&app),
+            vec!["teaching".to_string(), "research".to_string()]
+        );
+    }
+
+    #[test]
+    fn tag_layout_rows_name_mode_sorts_headers_alphabetically() {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![
+            tagged_workspace("a", Some("teaching")),
+            tagged_workspace("b", Some("research")),
+        ];
+        app.sidebar_spaces.tag_sort = crate::config::TagSortMode::Name;
+
+        assert_eq!(
+            ordered_tag_names(&app),
+            vec!["research".to_string(), "teaching".to_string()]
+        );
     }
 
     #[test]

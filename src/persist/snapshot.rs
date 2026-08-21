@@ -26,6 +26,14 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Per-tag-name color override (tag name -> `TagAccent` id). Empty by default,
+    /// so an old snapshot restores every tag on its stable-hash default.
+    #[serde(default)]
+    pub tag_colors: HashMap<String, String>,
+    /// Manual tag-group display order by tag name. Empty by default, which the
+    /// spaces list reads as first-appearance order.
+    #[serde(default)]
+    pub tag_order: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,6 +195,10 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    tag_colors: HashMap<String, String>,
+    #[serde(default)]
+    tag_order: Vec<String>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -202,6 +214,8 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        tag_colors: raw.tag_colors,
+        tag_order: raw.tag_order,
     })
 }
 
@@ -264,6 +278,8 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    tag_colors: HashMap<String, String>,
+    tag_order: Vec<String>,
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -276,6 +292,8 @@ pub fn capture(
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        tag_colors,
+        tag_order,
     }
 }
 
@@ -545,6 +563,8 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            state.tag_colors.clone(),
+            state.tag_order.clone(),
         )
     }
 
@@ -609,6 +629,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -697,6 +719,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -866,6 +890,41 @@ mod tests {
         let restored = parse_snapshot(&json).unwrap();
 
         assert_eq!(restored.workspaces[0].tag.as_deref(), Some("teaching"));
+    }
+
+    #[test]
+    fn capture_and_parse_round_trip_tag_colors_and_order() {
+        let mut state = state_with_workspaces(&["one"]);
+        state.tag_colors.insert("research".into(), "mauve".into());
+        state.tag_order = vec!["research".into(), "teaching".into()];
+
+        let json = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert_eq!(
+            restored.tag_colors.get("research").map(String::as_str),
+            Some("mauve")
+        );
+        assert_eq!(
+            restored.tag_order,
+            vec!["research".to_string(), "teaching".to_string()]
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_tag_colors_or_order_defaults_empty() {
+        let json = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "workspaces": [],
+            "active": null,
+            "selected": 0
+        })
+        .to_string();
+
+        let restored = parse_snapshot(&json).unwrap();
+
+        assert!(restored.tag_colors.is_empty());
+        assert!(restored.tag_order.is_empty());
     }
 
     #[test]
@@ -1298,6 +1357,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            tag_colors: std::collections::HashMap::new(),
+            tag_order: Vec::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

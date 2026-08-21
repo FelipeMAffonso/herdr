@@ -1074,6 +1074,27 @@ impl AppState {
                 {
                     return None;
                 }
+                if let Some(tag) = self.tag_header_at_row(mouse.row) {
+                    let collapsed = self
+                        .collapsed_space_keys
+                        .contains(&crate::ui::tag_collapse_key(&tag));
+                    let order = crate::ui::ordered_tag_names(self);
+                    let is_first = order.first().is_some_and(|first| *first == tag);
+                    let is_last = order.last().is_some_and(|last| *last == tag);
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::TagHeader {
+                            tag,
+                            collapsed,
+                            is_first,
+                            is_last,
+                        },
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                    return None;
+                }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
                     let kind = self

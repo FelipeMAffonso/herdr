@@ -23,6 +23,29 @@ impl AppState {
         detail_area
     }
 
+    /// Move the tag group `tag` one slot up (`up = true`) or down in the display
+    /// order, writing the full resulting order into `tag_order` and flipping the
+    /// sort mode to Manual (a manual edit always wins over name/first-appearance
+    /// ordering). A no-op when the tag is already at the edge, or not a group.
+    pub(crate) fn move_tag_group(&mut self, tag: &str, up: bool) {
+        let mut order = crate::ui::ordered_tag_names(self);
+        let Some(pos) = order.iter().position(|name| name == tag) else {
+            return;
+        };
+        let swap_with = if up {
+            pos.checked_sub(1)
+        } else {
+            (pos + 1 < order.len()).then_some(pos + 1)
+        };
+        let Some(swap_with) = swap_with else {
+            return;
+        };
+        order.swap(pos, swap_with);
+        self.tag_order = order;
+        self.sidebar_spaces.tag_sort = crate::config::TagSortMode::Manual;
+        self.mark_session_dirty();
+    }
+
     pub(super) fn workspace_list_scrollbar_target_at(
         &self,
         col: u16,
@@ -314,6 +337,25 @@ impl AppState {
         cards.iter().find_map(|card| {
             (!card.is_tag_header && row >= card.rect.y && row < card.rect.y + card.rect.height)
                 .then_some(card.ws_idx)
+        })
+    }
+
+    /// The tag name of the spaces-list group header at `row`, or `None` when the
+    /// row is not a header. Drives right-click header menus.
+    pub(super) fn tag_header_at_row(&self, row: u16) -> Option<String> {
+        let cards = if self.view.workspace_card_areas.is_empty() {
+            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+        } else {
+            self.view.workspace_card_areas.clone()
+        };
+        cards.iter().find_map(|card| {
+            (card.is_tag_header && row >= card.rect.y && row < card.rect.y + card.rect.height)
+                .then(|| {
+                    self.workspaces
+                        .get(card.ws_idx)
+                        .and_then(|ws| ws.tag().map(str::to_string))
+                })
+                .flatten()
         })
     }
 

@@ -461,6 +461,17 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
         return;
     };
 
+    // The tag color picker prefixes each accent name with a swatch glyph in that
+    // accent's own color, so the choice reads by color as well as by name.
+    let swatch_color = |idx: usize| -> Option<ratatui::style::Color> {
+        match &menu.kind {
+            crate::app::state::ContextMenuKind::TagColor { .. } => crate::ui::TagAccent::ALL
+                .get(idx)
+                .map(|accent| accent.color(p)),
+            _ => None,
+        }
+    };
+
     for (idx, item) in menu.items().iter().enumerate() {
         let y = inner.y + idx as u16;
         if y >= inner.y + inner.height {
@@ -468,29 +479,41 @@ pub(super) fn render_context_menu(app: &AppState, frame: &mut Frame) {
         }
         let row = Rect::new(inner.x, y, inner.width, 1);
         let selected = idx == menu.list.highlighted;
+        let swatch = swatch_color(idx);
         if selected {
             let row_bg = Style::default().bg(p.selection_bg);
             let buf = frame.buffer_mut();
             for x in row.x..row.x + row.width {
                 buf[(x, y)].set_style(row_bg);
             }
-            let line = Line::from(vec![
-                Span::styled("▎", Style::default().fg(p.accent).bg(p.selection_bg)),
-                Span::styled(
-                    format!("{item} "),
-                    Style::default()
-                        .fg(p.text)
-                        .bg(p.selection_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(line), row);
+            let mut spans = vec![Span::styled(
+                "▎",
+                Style::default().fg(p.accent).bg(p.selection_bg),
+            )];
+            if let Some(color) = swatch {
+                spans.push(Span::styled(
+                    "● ",
+                    Style::default().fg(color).bg(p.selection_bg),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{item} "),
+                Style::default()
+                    .fg(p.text)
+                    .bg(p.selection_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), row);
         } else {
-            let line = Line::from(vec![
-                Span::raw(" "),
-                Span::styled(format!("{item} "), Style::default().fg(p.text)),
-            ]);
-            frame.render_widget(Paragraph::new(line), row);
+            let mut spans = vec![Span::raw(" ")];
+            if let Some(color) = swatch {
+                spans.push(Span::styled("● ", Style::default().fg(color)));
+            }
+            spans.push(Span::styled(
+                format!("{item} "),
+                Style::default().fg(p.text),
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), row);
         }
     }
 }

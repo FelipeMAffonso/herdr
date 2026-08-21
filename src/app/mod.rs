@@ -416,6 +416,8 @@ impl App {
             sidebar_width_source,
             sidebar_section_split,
             collapsed_space_keys,
+            tag_colors,
+            tag_order,
         ) = if no_session {
             (
                 Vec::new(),
@@ -425,6 +427,8 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
             )
         } else if let Some(snap) = crate::persist::load() {
             let history = config
@@ -461,6 +465,8 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.tag_colors,
+                    snap.tag_order,
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
@@ -478,6 +484,8 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.tag_colors,
+                    snap.tag_order,
                 )
             }
         } else {
@@ -489,6 +497,8 @@ impl App {
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
             )
         };
 
@@ -584,6 +594,8 @@ impl App {
             worktree_remove: None,
             worktree_directory,
             collapsed_space_keys,
+            tag_colors,
+            tag_order,
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -884,6 +896,8 @@ impl App {
             app.state.sidebar_section_split = split;
         }
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
+        app.state.tag_colors = snapshot.tag_colors.clone();
+        app.state.tag_order = snapshot.tag_order.clone();
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
