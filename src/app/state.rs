@@ -1206,6 +1206,7 @@ pub enum ContextMenuKind {
         is_linked_worktree: bool,
         has_worktree_children: bool,
         collapsed: bool,
+        has_tag: bool,
     },
     /// Right-click menu on a tag group header row: reorder, collapse/expand,
     /// rename, and recolor the tag, all keyed by the tag name (not a ws_idx, so
@@ -1280,26 +1281,33 @@ impl ContextMenuState {
                 .map(|accent| accent.label())
                 .collect(),
             ContextMenuKind::GitWorkspace {
-                is_linked_worktree: false,
-                has_worktree_children: false,
-                ..
-            } => vec!["Rename", "Close", "New worktree", "Open worktree..."],
-            ContextMenuKind::GitWorkspace {
-                is_linked_worktree: true,
-                ..
-            } => vec!["Rename", "Close", "Delete worktree checkout..."],
-            ContextMenuKind::GitWorkspace {
-                is_linked_worktree: false,
-                has_worktree_children: true,
+                is_linked_worktree,
+                has_worktree_children,
                 collapsed,
+                has_tag,
                 ..
-            } => vec![
-                "Rename",
-                "Close group",
-                "New worktree",
-                "Open worktree...",
-                if collapsed { "Expand" } else { "Collapse" },
-            ],
+            } => {
+                let mut items = vec!["Rename", "Tag..."];
+                if has_tag {
+                    items.push("Rename tag...");
+                    items.push("Tag color...");
+                    items.push("Remove tag");
+                }
+                if is_linked_worktree {
+                    items.extend(["Close", "Delete worktree checkout..."]);
+                } else {
+                    items.push(if has_worktree_children {
+                        "Close group"
+                    } else {
+                        "Close"
+                    });
+                    items.extend(["New worktree", "Open worktree..."]);
+                    if has_worktree_children {
+                        items.push(if collapsed { "Expand" } else { "Collapse" });
+                    }
+                }
+                items
+            }
             ContextMenuKind::Tab { .. } => vec!["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
                 source_pane_id,
@@ -2642,6 +2650,7 @@ mod tests {
                 is_linked_worktree: true,
                 has_worktree_children: false,
                 collapsed: false,
+                has_tag: false,
             },
             x: 0,
             y: 0,
@@ -2650,7 +2659,7 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "Delete worktree checkout..."]
+            &["Rename", "Tag...", "Close", "Delete worktree checkout..."]
         );
     }
 
@@ -2662,6 +2671,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 collapsed: false,
+                has_tag: false,
             },
             x: 0,
             y: 0,
@@ -2670,7 +2680,7 @@ mod tests {
 
         assert_eq!(
             menu.items(),
-            &["Rename", "Close", "New worktree", "Open worktree..."]
+            &["Rename", "Tag...", "Close", "New worktree", "Open worktree..."]
         );
     }
 
@@ -2682,6 +2692,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: false,
+                has_tag: false,
             },
             x: 0,
             y: 0,
@@ -2692,10 +2703,41 @@ mod tests {
             menu.items(),
             &[
                 "Rename",
+                "Tag...",
                 "Close group",
                 "New worktree",
                 "Open worktree...",
                 "Collapse"
+            ]
+        );
+    }
+
+    #[test]
+    fn tagged_git_workspace_context_menu_offers_tag_management() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::GitWorkspace {
+                ws_idx: 0,
+                is_linked_worktree: false,
+                has_worktree_children: false,
+                collapsed: false,
+                has_tag: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+
+        assert_eq!(
+            menu.items(),
+            &[
+                "Rename",
+                "Tag...",
+                "Rename tag...",
+                "Tag color...",
+                "Remove tag",
+                "Close",
+                "New worktree",
+                "Open worktree..."
             ]
         );
     }

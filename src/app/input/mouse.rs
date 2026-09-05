@@ -1126,6 +1126,7 @@ impl AppState {
                                 collapsed: group_state
                                     .as_ref()
                                     .is_some_and(|(_, collapsed)| *collapsed),
+                                has_tag: ws.tag().is_some(),
                             })
                         })
                         .unwrap_or(ContextMenuKind::Workspace {

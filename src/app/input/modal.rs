@@ -929,13 +929,25 @@ pub(super) fn apply_context_menu_action(
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
         }
-        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Tag..."),
+        ) => {
             open_tag_workspace(state, ws_idx);
         }
-        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Rename tag...")) => {
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Rename tag..."),
+        ) => {
             open_rename_tag(state, ws_idx);
         }
-        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag color...")) => {
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Tag color..."),
+        ) => {
             if let Some(tag) = state
                 .workspaces
                 .get(ws_idx)
@@ -947,7 +959,11 @@ pub(super) fn apply_context_menu_action(
                 leave_modal(state);
             }
         }
-        (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
+        (
+            ContextMenuKind::Workspace { ws_idx, .. }
+            | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Remove tag"),
+        ) => {
             if let Some(ws) = state.workspaces.get_mut(ws_idx) {
                 ws.set_tag(None);
                 state.mark_session_dirty();
@@ -1438,13 +1454,25 @@ impl App {
                 | ContextMenuKind::GitWorkspace { ws_idx, .. },
                 Some("Rename"),
             ) => open_rename_workspace(&mut self.state, &self.terminal_runtimes, ws_idx),
-            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag...")) => {
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Tag..."),
+            ) => {
                 open_tag_workspace(&mut self.state, ws_idx);
             }
-            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Rename tag...")) => {
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Rename tag..."),
+            ) => {
                 open_rename_tag(&mut self.state, ws_idx);
             }
-            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Tag color...")) => {
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Tag color..."),
+            ) => {
                 if let Some(tag) = self
                     .state
                     .workspaces
@@ -1457,7 +1485,11 @@ impl App {
                     leave_modal(&mut self.state);
                 }
             }
-            (ContextMenuKind::Workspace { ws_idx, .. }, Some("Remove tag")) => {
+            (
+                ContextMenuKind::Workspace { ws_idx, .. }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. },
+                Some("Remove tag"),
+            ) => {
                 if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
                     ws.set_tag(None);
                     self.state.mark_session_dirty();
@@ -2573,6 +2605,7 @@ mod tests {
                 is_linked_worktree: false,
                 has_worktree_children: true,
                 collapsed: false,
+                has_tag: false,
             },
             x: 0,
             y: 0,
@@ -2580,7 +2613,8 @@ mod tests {
         };
         let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
 
-        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 1);
+        // Item 2 is "Close group" (after "Rename" and "Tag...").
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, 2);
 
         assert_eq!(state.selected, 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
